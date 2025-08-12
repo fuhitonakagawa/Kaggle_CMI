@@ -1,0 +1,147 @@
+bfrb_behaviors:
+- Above ear - pull hair
+- Cheek - pinch skin
+- Eyebrow - pull hair
+- Eyelash - pull hair
+- Forehead - pull hairline
+- Forehead - scratch
+- Neck - pinch skin
+- Neck - scratch
+data:
+  test_demographics_path: ../cmi-detect-behavior-with-sensor-data/test_demographics.csv
+  test_path: ../cmi-detect-behavior-with-sensor-data/test.csv
+  train_demographics_path: ../cmi-detect-behavior-with-sensor-data/train_demographics.csv
+  train_path: ../cmi-detect-behavior-with-sensor-data/train.csv
+ensemble:
+  method: weighted_average
+  use_oof_predictions: true
+  weights:
+    lightgbm: 0.6
+    xgboost: 0.4
+evaluation:
+  early_stopping_metric: competition_score
+  metrics:
+  - competition_score
+  - binary_f1
+  - macro_f1
+  - accuracy
+features:
+  additional:
+    angle_velocity: true
+    jerk: true
+    orientation_changes: true
+    rotation_energy: true
+  change_detection:
+    enabled: true
+    penalty: 1
+  frequency:
+    enabled: true
+    features:
+    - fft_max_freq
+    - fft_max_power
+    - spectral_centroid
+    - spectral_rolloff
+    - spectral_entropy
+    - spectral_bandwidth
+    - zero_crossing_rate
+    sampling_rate: 20
+  imu_cols:
+    acc:
+    - acc_x
+    - acc_y
+    - acc_z
+    rot:
+    - rot_w
+    - rot_x
+    - rot_y
+    - rot_z
+  segment:
+    enabled: true
+    n_segments: 3
+  statistical:
+    enabled: true
+    functions:
+    - mean
+    - std
+    - min
+    - max
+    - median
+    - q25
+    - q75
+    - iqr
+    - skew
+    - kurt
+  world_acceleration:
+    enabled: true
+    use_quaternion_correction: true
+general:
+  debug: false
+  device: cpu
+  n_folds: 5
+  seed: 42
+  verbose: true
+lightgbm:
+  colsample_bytree: 0.6
+  early_stopping_rounds: 150
+  learning_rate: 0.03
+  max_depth: 8
+  min_child_samples: 20
+  min_split_gain: 0.001
+  n_estimators: 500
+  n_jobs: -1
+  num_class: 18
+  num_leaves: 31
+  objective: multiclass
+  random_state: 42
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+  subsample: 0.7
+  verbosity: -1
+non_bfrb_behaviors:
+- Drink from bottle/cup
+- Feel around in tray and pull out an object
+- Glasses on/off
+- Pinch knee/leg skin
+- Pull air toward your face
+- Scratch knee/leg skin
+- Text on phone
+- Wave hello
+- Write name in air
+- Write name on leg
+output:
+  model_dir: models/
+  results_dir: results/
+  save_confusion_matrix: true
+  save_feature_importance: true
+  save_training_history: true
+  submission_dir: submissions/
+postprocessing:
+  bfrb_boost_factor: 1.25
+  confidence_threshold: 0.35
+  enabled: true
+  smooth_window: 5
+  tta_n_augmentations: 3
+  use_test_time_augmentation: true
+training:
+  log_interval: 50
+  monitor_training: true
+  save_best_model: true
+  save_oof_predictions: true
+  use_gpu: false
+xgboost:
+  colsample_bytree: 0.6
+  early_stopping_rounds: 150
+  gamma: 0.1
+  learning_rate: 0.03
+  max_depth: 8
+  min_child_weight: 5
+  n_estimators: 500
+  n_jobs: -1
+  num_class: 18
+  objective: multi:softprob
+  random_state: 42
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+  subsample: 0.7
+  tree_method: hist
+  verbosity: 0
