@@ -4,59 +4,6 @@
 
 このディレクトリには、CMI BFRB コンペティション用の IMU-only LightGBM モデルのサブミッション用ファイルが含まれています。
 
-## ファイル構成
-
-- `train_notebook.ipynb`: モデル訓練用ノートブック
-- `inference_notebook.ipynb`: 推論・サブミッション生成用ノートブック
-- `inference.py`: 推論スクリプト（ノートブックの Python 版）
-
-## サブミッション手順
-
-### 1. モデルの訓練
-
-#### Kaggle Notebook 上での実行:
-
-1. Kaggle で新しいノートブックを作成
-2. `train_notebook.ipynb`の内容をコピー
-3. 以下のデータセットを追加:
-   - `cmi-detect-behavior-with-sensor-data` (コンペティションデータ)
-4. ノートブックを実行してモデルを訓練
-5. 出力される`imu_lgbm_model.pkl`を保存
-
-### 2. モデルのアップロード
-
-1. 訓練済みモデル(`imu_lgbm_model.pkl`)を Kaggle Dataset としてアップロード
-2. データセット名を`imu-lgbm-model`として保存（または適切な名前を付ける）
-
-### 3. 推論とサブミッション生成
-
-#### 方法 A: Notebook 版を使用
-
-1. Kaggle で新しいノートブックを作成
-2. `inference_notebook.ipynb`の内容をコピー
-3. 以下のデータセットを追加:
-   - `cmi-detect-behavior-with-sensor-data` (コンペティションデータ)
-   - `imu-lgbm-model` (訓練済みモデル)
-4. モデルパスを更新:
-   ```python
-   model_path = '/kaggle/input/imu-lgbm-model/imu_lgbm_model.pkl'
-   ```
-5. ノートブックを実行
-6. `submission.parquet`が生成される
-
-#### 方法 B: Python Script 版を使用
-
-1. Kaggle で新しいノートブックを作成
-2. Code cell に`inference.py`の内容をコピー
-3. データセットを追加（方法 A と同じ）
-4. モデルパスを更新（必要に応じて）
-5. スクリプトを実行
-
-### 4. サブミット
-
-1. 生成された`submission.parquet`をダウンロード
-2. コンペティションページの"Submit Predictions"から提出
-
 ## 重要な注意事項
 
 ### CMI Inference Server について

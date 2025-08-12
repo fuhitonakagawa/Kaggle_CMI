@@ -1,0 +1,170 @@
+# IMU改良モデル設定ファイル
+# Version: 2.0.0
+# Date: 2025-01-12
+
+# データパス
+data:
+  train_path: "../cmi-detect-behavior-with-sensor-data/train.csv"
+  train_demographics_path: "../cmi-detect-behavior-with-sensor-data/train_demographics.csv"
+  test_path: "../cmi-detect-behavior-with-sensor-data/test.csv"
+  test_demographics_path: "../cmi-detect-behavior-with-sensor-data/test_demographics.csv"
+
+# 基本設定
+general:
+  seed: 42
+  n_folds: 5
+  device: "cpu"  # 'gpu' or 'cpu'
+  verbose: True
+  debug: False
+
+# 特徴量設定
+features:
+  # IMUセンサー列
+  imu_cols:
+    acc: ["acc_x", "acc_y", "acc_z"]
+    rot: ["rot_w", "rot_x", "rot_y", "rot_z"]
+  
+  # 統計特徴量
+  statistical:
+    enabled: True
+    functions: ["mean", "std", "min", "max", "median", "q25", "q75", "iqr", "skew", "kurt"]
+    
+  # World Acceleration
+  world_acceleration:
+    enabled: True
+    use_quaternion_correction: True
+    
+  # 周波数領域特徴量
+  frequency:
+    enabled: True
+    sampling_rate: 20  # Hz
+    features:
+      - fft_max_freq
+      - fft_max_power
+      - spectral_centroid
+      - spectral_rolloff
+      - spectral_entropy
+      - spectral_bandwidth
+      - zero_crossing_rate
+      
+  # セグメント特徴量
+  segment:
+    enabled: True
+    n_segments: 3  # beginning, middle, end
+    
+  # 変化点検出
+  change_detection:
+    enabled: True
+    penalty: 1
+    
+  # 追加特徴量
+  additional:
+    jerk: True  # 加速度の変化率
+    rotation_energy: True  # 回転エネルギー
+    angle_velocity: True  # 角速度
+    orientation_changes: True  # 向きの変化
+
+# LightGBMパラメータ
+lightgbm:
+  objective: "multiclass"
+  num_class: 18
+  n_estimators: 500  # メモリ節約のため削減
+  max_depth: 8       # 深さを制限
+  learning_rate: 0.03  # 学習率を少し上げる
+  num_leaves: 31
+  colsample_bytree: 0.6
+  subsample: 0.7
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+  random_state: 42
+  n_jobs: -1
+  verbosity: -1
+  early_stopping_rounds: 150
+  min_child_samples: 20
+  min_split_gain: 0.001
+
+# XGBoostパラメータ
+xgboost:
+  objective: "multi:softprob"
+  num_class: 18
+  n_estimators: 500  # メモリ節約のため削減
+  max_depth: 8      # 深さを制限
+  learning_rate: 0.03  # 学習率を少し上げる
+  colsample_bytree: 0.6
+  subsample: 0.7
+  reg_alpha: 0.1
+  reg_lambda: 0.1
+  random_state: 42
+  n_jobs: -1
+  verbosity: 0
+  early_stopping_rounds: 150
+  min_child_weight: 5
+  gamma: 0.1
+  tree_method: "hist"  # GPUの場合は "gpu_hist"
+
+# アンサンブル設定
+ensemble:
+  method: "weighted_average"  # "simple_average", "weighted_average", "stacking"
+  weights:
+    lightgbm: 0.6
+    xgboost: 0.4
+  use_oof_predictions: True
+
+# 後処理設定
+postprocessing:
+  enabled: True
+  confidence_threshold: 0.35
+  bfrb_boost_factor: 1.25
+  smooth_window: 5
+  use_test_time_augmentation: True
+  tta_n_augmentations: 3
+
+# BFRB行動リスト
+bfrb_behaviors:
+  - "Above ear - pull hair"
+  - "Cheek - pinch skin"
+  - "Eyebrow - pull hair"
+  - "Eyelash - pull hair"
+  - "Forehead - pull hairline"
+  - "Forehead - scratch"
+  - "Neck - pinch skin"
+  - "Neck - scratch"
+
+# 非BFRB行動リスト
+non_bfrb_behaviors:
+  - "Drink from bottle/cup"
+  - "Feel around in tray and pull out an object"
+  - "Glasses on/off"
+  - "Pinch knee/leg skin"
+  - "Pull air toward your face"
+  - "Scratch knee/leg skin"
+  - "Text on phone"
+  - "Wave hello"
+  - "Write name in air"
+  - "Write name on leg"
+
+# 評価設定
+evaluation:
+  metrics:
+    - "competition_score"  # (Binary F1 + Macro F1) / 2
+    - "binary_f1"
+    - "macro_f1"
+    - "accuracy"
+  early_stopping_metric: "competition_score"
+  
+# 訓練設定
+training:
+  use_gpu: False  # Metal GPUは使用しない（LightGBM/XGBoostはCPU）
+  save_best_model: True
+  save_oof_predictions: True
+  monitor_training: True
+  log_interval: 50
+
+# 出力設定
+output:
+  model_dir: "models/"
+  results_dir: "results/"
+  submission_dir: "submissions/"
+  save_feature_importance: True
+  save_confusion_matrix: True
+  save_training_history: True
