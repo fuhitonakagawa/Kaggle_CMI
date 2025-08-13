@@ -10,6 +10,10 @@ wheels/
 .venv
 
 .DS_Store
-*.pkl
 
+# Artifact
+*.pkl
+*.parquet
+
+# dataset
 cmi-detect-behavior-with-sensor-data/

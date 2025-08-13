@@ -20,9 +20,9 @@ import pickle
 import time
 import warnings
 from datetime import datetime
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import List, Tuple
-from multiprocessing import Pool, cpu_count
 
 import numpy as np
 import pandas as pd
@@ -39,11 +39,13 @@ from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
-print("=" * 70)
-print("CMI BFRB Detection - Advanced Feature Engineering v1.1")
-print("XGBoost with comprehensive sensor fusion features")
-print("With Export/Import capability for faster iteration")
-print("=" * 70)
+# Only print header in main process (not in multiprocessing workers)
+if __name__ == "__main__":
+    print("=" * 70)
+    print("CMI BFRB Detection - Advanced Feature Engineering v1.1")
+    print("XGBoost with comprehensive sensor fusion features")
+    print("With Export/Import capability for faster iteration")
+    print("=" * 70)
 
 # ====================================================================================================
 # ENVIRONMENT CONFIGURATION
@@ -54,20 +56,22 @@ IS_KAGGLE_ENV = False  # Set to True for Kaggle, False for local MacBook
 
 # ⚙️ FEATURE EXTRACTION SETTINGS
 # Change these variables to control behavior:
-USE_EXPORTED_FEATURES = False  # Set to True to skip feature extraction
-EXPORTED_FEATURES_PATH = ""  # Path to exported features (if USE_EXPORTED_FEATURES=True)
-EXPORT_FEATURES = True  # Set to True to export features after extraction
+USE_EXPORTED_FEATURES = True  # Set to True to skip feature extraction
+EXPORT_FEATURES = False  # Set to False when using exported features
 EXPORT_NAME = None  # Custom name for export (None = auto-generate timestamp)
 
+# Auto-set exported features path based on environment
+if IS_KAGGLE_ENV:
+    # Kaggle dataset path
+    EXPORTED_FEATURES_PATH = "/kaggle/input/cmi-bfrb-detection-exported-feature-data/features_v1.1.0_20250813_161440"
+else:
+    # Local path
+    EXPORTED_FEATURES_PATH = "exported_features/features_v1.1.0_20250813_161440"
+
 # Example usage:
-# 1. First run (extract and export):
-#    USE_EXPORTED_FEATURES = False
-#    EXPORT_FEATURES = True
-#
-# 2. Subsequent runs (use exported):
-#    USE_EXPORTED_FEATURES = True
-#    EXPORTED_FEATURES_PATH = "./exported_features/features_v1.1.0_20241113_150000"  # Kaggle
-#    EXPORTED_FEATURES_PATH = "./6_Feature_Research/exported_features/features_v1.1.0_20241113_150000"  # Local
+# For Kaggle: Just set IS_KAGGLE_ENV = True
+# For Local: Just set IS_KAGGLE_ENV = False
+# The path will be automatically configured!
 
 # Set paths based on environment
 if IS_KAGGLE_ENV:
@@ -82,10 +86,17 @@ else:
 EXPORT_DIR.mkdir(exist_ok=True, parents=True)
 FEATURE_VERSION = "v1.1.0"
 
-print(f"🌍 Environment: {'KAGGLE' if IS_KAGGLE_ENV else 'LOCAL (MacBook)'}")
-print(f"📁 Export directory: {EXPORT_DIR}")
-print(f"📊 Data directory: {DATA_BASE_PATH}")
-print(f"⚡ Parallel processing: {'DISABLED (Kaggle)' if IS_KAGGLE_ENV else 'ENABLED (Local)'}")
+# Only print configuration in main process
+if __name__ == "__main__":
+    print(f"🌍 Environment: {'KAGGLE' if IS_KAGGLE_ENV else 'LOCAL (MacBook)'}")
+    print(f"📁 Export directory: {EXPORT_DIR}")
+    print(f"📊 Data directory: {DATA_BASE_PATH}")
+    print(
+        f"⚡ Parallel processing: {'DISABLED (Kaggle)' if IS_KAGGLE_ENV else 'ENABLED (Local)'}"
+    )
+    print(
+        f"🎮 XGBoost GPU: {'ENABLED (CUDA/T4)' if IS_KAGGLE_ENV else 'DISABLED (CPU only)'}"
+    )
 
 # ====================================================================================================
 # CONFIGURATION
@@ -166,8 +177,7 @@ CONFIG = {
         "min_child_weight": 3,
         "random_state": 42,
         "n_jobs": -1,
-        "tree_method": "hist",
-        "device": "cpu",
+        "early_stopping_rounds": 50,
     },
 }
 
@@ -195,10 +205,12 @@ GESTURE_MAPPER = {
 
 REVERSE_GESTURE_MAPPER = {v: k for k, v in GESTURE_MAPPER.items()}
 
-print(f"✓ Configuration loaded ({len(GESTURE_MAPPER)} gesture classes)")
-print(
-    f"📍 Data paths configured for {'Kaggle' if IS_KAGGLE_ENV else 'Local'} environment"
-)
+# Only print configuration in main process
+if __name__ == "__main__":
+    print(f"✓ Configuration loaded ({len(GESTURE_MAPPER)} gesture classes)")
+    print(
+        f"📍 Data paths configured for {'Kaggle' if IS_KAGGLE_ENV else 'Local'} environment"
+    )
 
 # ====================================================================================================
 # QUATERNION AND IMU PROCESSING
@@ -1921,37 +1933,45 @@ class FeatureExtractor:
     ) -> pd.DataFrame:
         """Fit transformers and extract features from training data."""
         print("Extracting features from sequences...")
-        
+
         start_time = time.time()
         feature_dfs = []
-        
+
         # Use parallel processing for local environment, sequential for Kaggle
         if not IS_KAGGLE_ENV:
             # Local environment: Use parallel processing
             n_processes = min(cpu_count() - 1, 8)  # Leave one CPU free, max 8 processes
-            print(f"  Processing {len(sequences)} sequences in PARALLEL (Local environment)")
+            print(
+                f"  Processing {len(sequences)} sequences in PARALLEL (Local environment)"
+            )
             print(f"  Using {n_processes} processes")
-            
+
             # Prepare data for parallel processing
             data_with_extractor = [
                 (self, seq, demo) for seq, demo in zip(sequences, demographics)
             ]
-            
+
             # Extract features in parallel with progress bar
             with Pool(n_processes) as pool:
                 # Use imap for better memory efficiency and progress tracking
-                with tqdm(total=len(sequences), desc="Processing sequences (parallel)") as pbar:
+                with tqdm(
+                    total=len(sequences), desc="Processing sequences (parallel)"
+                ) as pbar:
                     # Optimize chunksize based on number of sequences
                     chunksize = max(1, len(sequences) // (n_processes * 10))
                     for features in pool.imap(
-                        extract_features_parallel, data_with_extractor, chunksize=chunksize
+                        extract_features_parallel,
+                        data_with_extractor,
+                        chunksize=chunksize,
                     ):
                         feature_dfs.append(features)
                         pbar.update(1)
         else:
             # Kaggle environment: Use sequential processing
-            print(f"  Processing {len(sequences)} sequences SEQUENTIALLY (Kaggle environment)")
-            
+            print(
+                f"  Processing {len(sequences)} sequences SEQUENTIALLY (Kaggle environment)"
+            )
+
             # Sequential processing with progress bar
             for seq_df, demo_df in tqdm(
                 zip(sequences, demographics),
@@ -1967,7 +1987,9 @@ class FeatureExtractor:
             f"  Average time per sequence: {elapsed_time / len(sequences):.3f} seconds"
         )
 
+        print("  Concatenating feature DataFrames...")
         X = pd.concat(feature_dfs, ignore_index=True)
+        print(f"  Feature matrix created: {X.shape}")
 
         # Store feature names
         self.feature_names = list(X.columns)
@@ -1976,6 +1998,7 @@ class FeatureExtractor:
         self.is_fitted = True
 
         # Fit scaler
+        print("  Scaling features...")
         if self.config["robust_scaler"]:
             self.scaler = RobustScaler()
         else:
@@ -1984,7 +2007,7 @@ class FeatureExtractor:
         X_scaled = self.scaler.fit_transform(X)
         X = pd.DataFrame(X_scaled, columns=self.feature_names)
 
-        print(f"✓ Extracted {len(self.feature_names)} features")
+        print(f"✓ Extracted and scaled {len(self.feature_names)} features")
 
         return X
 
@@ -2043,9 +2066,9 @@ class FeatureExporter:
             export_name = f"features_{FEATURE_VERSION}_{timestamp}"
 
         export_path = EXPORT_DIR / export_name
-        export_path.mkdir(exist_ok=True)
+        export_path.mkdir(exist_ok=True, parents=True)
 
-        print(f"\nExporting features to: {export_path}")
+        print(f"  Saving to: {export_path}")
 
         # Save features as Parquet
         features_file = export_path / "features.parquet"
@@ -2122,7 +2145,7 @@ def train_models():
     """Train XGBoost models with cross-validation, with feature import/export."""
     # Access global variables
     global USE_EXPORTED_FEATURES, EXPORTED_FEATURES_PATH, EXPORT_FEATURES, EXPORT_NAME
-    
+
     print("\n" + "=" * 70)
     print("TRAINING PHASE")
     print("=" * 70)
@@ -2225,10 +2248,11 @@ def train_models():
 
         # Export features if requested
         if EXPORT_FEATURES:
+            print("\n💾 Exporting features for future use...")
             export_path = FeatureExporter.export_features(
                 X, extractor, labels, subjects, EXPORT_NAME
             )
-            print(f"\n💾 Features exported for future use: {export_path}")
+            print(f"✓ Features exported to: {export_path}")
             print("\n📝 To use these features in the future, set:")
             print("   USE_EXPORTED_FEATURES = True")
             if IS_KAGGLE_ENV:
@@ -2256,15 +2280,30 @@ def train_models():
 
         print(f"Train: {len(X_train)}, Val: {len(X_val)}")
 
+        # Configure XGBoost parameters based on environment
+        xgb_params = CONFIG["xgb_params"].copy()
+
+        # GPU acceleration settings
+        if IS_KAGGLE_ENV:
+            # Kaggle with T4 GPUs
+            xgb_params["tree_method"] = "gpu_hist"
+            xgb_params["device"] = "cuda"
+            xgb_params["gpu_id"] = 0  # Use first GPU
+            print("  Using GPU acceleration (CUDA/T4)")
+        else:
+            # Local Mac - MPS is not yet supported by XGBoost, use CPU
+            xgb_params["tree_method"] = "hist"
+            xgb_params["device"] = "cpu"
+            print("  Using CPU (MPS not supported by XGBoost)")
+
         # Train XGBoost
-        model = xgb.XGBClassifier(**CONFIG["xgb_params"])
+        model = xgb.XGBClassifier(**xgb_params)
 
         model.fit(
             X_train,
             y_train,
             eval_set=[(X_val, y_val)],
             verbose=100,
-            early_stopping_rounds=50,
         )
 
         models.append(model)
