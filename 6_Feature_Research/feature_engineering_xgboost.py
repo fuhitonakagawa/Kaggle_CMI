@@ -14,11 +14,15 @@
 #
 # ====================================================================================================
 
+import json
 import os
+import pickle
 import time
 import warnings
+from datetime import datetime
+from pathlib import Path
+from typing import List, Tuple
 from multiprocessing import Pool, cpu_count
-from typing import List
 
 import numpy as np
 import pandas as pd
@@ -36,26 +40,79 @@ from tqdm import tqdm
 warnings.filterwarnings("ignore")
 
 print("=" * 70)
-print("CMI BFRB Detection - Advanced Feature Engineering v1.0")
+print("CMI BFRB Detection - Advanced Feature Engineering v1.1")
 print("XGBoost with comprehensive sensor fusion features")
+print("With Export/Import capability for faster iteration")
 print("=" * 70)
+
+# ====================================================================================================
+# ENVIRONMENT CONFIGURATION
+# ====================================================================================================
+
+# 🔧 MAIN ENVIRONMENT SWITCH - CHANGE THIS TO SWITCH BETWEEN KAGGLE AND LOCAL
+IS_KAGGLE_ENV = False  # Set to True for Kaggle, False for local MacBook
+
+# ⚙️ FEATURE EXTRACTION SETTINGS
+# Change these variables to control behavior:
+USE_EXPORTED_FEATURES = False  # Set to True to skip feature extraction
+EXPORTED_FEATURES_PATH = ""  # Path to exported features (if USE_EXPORTED_FEATURES=True)
+EXPORT_FEATURES = True  # Set to True to export features after extraction
+EXPORT_NAME = None  # Custom name for export (None = auto-generate timestamp)
+
+# Example usage:
+# 1. First run (extract and export):
+#    USE_EXPORTED_FEATURES = False
+#    EXPORT_FEATURES = True
+#
+# 2. Subsequent runs (use exported):
+#    USE_EXPORTED_FEATURES = True
+#    EXPORTED_FEATURES_PATH = "./exported_features/features_v1.1.0_20241113_150000"  # Kaggle
+#    EXPORTED_FEATURES_PATH = "./6_Feature_Research/exported_features/features_v1.1.0_20241113_150000"  # Local
+
+# Set paths based on environment
+if IS_KAGGLE_ENV:
+    # Kaggle paths
+    EXPORT_DIR = Path("./exported_features")
+    DATA_BASE_PATH = Path("/kaggle/input/cmi-detect-behavior-with-sensor-data")
+else:
+    # Local MacBook paths
+    EXPORT_DIR = Path("exported_features")
+    DATA_BASE_PATH = Path("cmi-detect-behavior-with-sensor-data")
+
+EXPORT_DIR.mkdir(exist_ok=True, parents=True)
+FEATURE_VERSION = "v1.1.0"
+
+print(f"🌍 Environment: {'KAGGLE' if IS_KAGGLE_ENV else 'LOCAL (MacBook)'}")
+print(f"📁 Export directory: {EXPORT_DIR}")
+print(f"📊 Data directory: {DATA_BASE_PATH}")
+print(f"⚡ Parallel processing: {'DISABLED (Kaggle)' if IS_KAGGLE_ENV else 'ENABLED (Local)'}")
 
 # ====================================================================================================
 # CONFIGURATION
 # ====================================================================================================
 
-# ====================================================================================================
-# ENVIRONMENT DETECTION AND PATH CONFIGURATION
-# ======================================================================
+# Set data paths based on environment
+if IS_KAGGLE_ENV:
+    # Kaggle paths
+    DATA_PATHS = {
+        "train_path": str(DATA_BASE_PATH / "train.csv"),
+        "train_demographics_path": str(DATA_BASE_PATH / "train_demographics.csv"),
+        "test_path": str(DATA_BASE_PATH / "test.csv"),
+        "test_demographics_path": str(DATA_BASE_PATH / "test_demographics.csv"),
+    }
+else:
+    # Local MacBook paths
+    DATA_PATHS = {
+        "train_path": str(DATA_BASE_PATH / "train.csv"),
+        "train_demographics_path": str(DATA_BASE_PATH / "train_demographics.csv"),
+        "test_path": str(DATA_BASE_PATH / "test.csv"),
+        "test_demographics_path": str(DATA_BASE_PATH / "test_demographics.csv"),
+    }
 
-
-# Kaggle paths
-DATA_PATHS = {
-    "train_path": "/kaggle/input/cmi-detect-behavior-with-sensor-data/train.csv",
-    "train_demographics_path": "/kaggle/input/cmi-detect-behavior-with-sensor-data/train_demographics.csv",
-    "test_path": "/kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv",
-    "test_demographics_path": "/kaggle/input/cmi-detect-behavior-with-sensor-data/test_demographics.csv",
-}
+    # Check if local data exists
+    if not DATA_BASE_PATH.exists():
+        print(f"⚠️ Warning: Local data directory not found: {DATA_BASE_PATH}")
+        print("Please ensure the data files are in the correct location.")
 
 CONFIG = {
     # Data paths
@@ -139,6 +196,9 @@ GESTURE_MAPPER = {
 REVERSE_GESTURE_MAPPER = {v: k for k, v in GESTURE_MAPPER.items()}
 
 print(f"✓ Configuration loaded ({len(GESTURE_MAPPER)} gesture classes)")
+print(
+    f"📍 Data paths configured for {'Kaggle' if IS_KAGGLE_ENV else 'Local'} environment"
+)
 
 # ====================================================================================================
 # QUATERNION AND IMU PROCESSING
@@ -1315,7 +1375,7 @@ def extract_multi_resolution_features(sequence_df: pd.DataFrame, config: dict) -
 
 
 def extract_features_parallel(args):
-    """Global function for parallel feature extraction."""
+    """Global function for parallel feature extraction (used only in local environment)."""
     extractor, seq_df, demo_df = args
     return extractor.extract_features(seq_df, demo_df)
 
@@ -1861,30 +1921,45 @@ class FeatureExtractor:
     ) -> pd.DataFrame:
         """Fit transformers and extract features from training data."""
         print("Extracting features from sequences...")
-
-        # Determine number of processes to use
-        n_processes = min(cpu_count() - 1, 8)  # Leave one CPU free, max 8 processes
-        print(f"  Using {n_processes} processes for parallel extraction")
-
-        # Prepare data for parallel processing
-        data_with_extractor = [
-            (self, seq, demo) for seq, demo in zip(sequences, demographics)
-        ]
-
-        # Extract features in parallel with progress bar
+        
         start_time = time.time()
         feature_dfs = []
-
-        with Pool(n_processes) as pool:
-            # Use imap for better memory efficiency and progress tracking
-            with tqdm(total=len(sequences), desc="Processing sequences") as pbar:
-                # Optimize chunksize based on number of sequences
-                chunksize = max(1, len(sequences) // (n_processes * 10))
-                for features in pool.imap(
-                    extract_features_parallel, data_with_extractor, chunksize=chunksize
-                ):
-                    feature_dfs.append(features)
-                    pbar.update(1)
+        
+        # Use parallel processing for local environment, sequential for Kaggle
+        if not IS_KAGGLE_ENV:
+            # Local environment: Use parallel processing
+            n_processes = min(cpu_count() - 1, 8)  # Leave one CPU free, max 8 processes
+            print(f"  Processing {len(sequences)} sequences in PARALLEL (Local environment)")
+            print(f"  Using {n_processes} processes")
+            
+            # Prepare data for parallel processing
+            data_with_extractor = [
+                (self, seq, demo) for seq, demo in zip(sequences, demographics)
+            ]
+            
+            # Extract features in parallel with progress bar
+            with Pool(n_processes) as pool:
+                # Use imap for better memory efficiency and progress tracking
+                with tqdm(total=len(sequences), desc="Processing sequences (parallel)") as pbar:
+                    # Optimize chunksize based on number of sequences
+                    chunksize = max(1, len(sequences) // (n_processes * 10))
+                    for features in pool.imap(
+                        extract_features_parallel, data_with_extractor, chunksize=chunksize
+                    ):
+                        feature_dfs.append(features)
+                        pbar.update(1)
+        else:
+            # Kaggle environment: Use sequential processing
+            print(f"  Processing {len(sequences)} sequences SEQUENTIALLY (Kaggle environment)")
+            
+            # Sequential processing with progress bar
+            for seq_df, demo_df in tqdm(
+                zip(sequences, demographics),
+                total=len(sequences),
+                desc="Processing sequences (sequential)",
+            ):
+                features = self.extract_features(seq_df, demo_df)
+                feature_dfs.append(features)
 
         elapsed_time = time.time() - start_time
         print(f"  Extraction completed in {elapsed_time:.1f} seconds")
@@ -1917,9 +1992,15 @@ class FeatureExtractor:
         self, sequences: List[pd.DataFrame], demographics: List[pd.DataFrame]
     ) -> pd.DataFrame:
         """Extract features from test data using fitted transformers."""
-        # Extract features
+        print("Transforming test sequences...")
+
+        # Extract features sequentially with progress bar
         feature_dfs = []
-        for seq_df, demo_df in zip(sequences, demographics):
+        for seq_df, demo_df in tqdm(
+            zip(sequences, demographics),
+            total=len(sequences),
+            desc="Processing test sequences",
+        ):
             features = self.extract_features(seq_df, demo_df)
             feature_dfs.append(features)
 
@@ -1940,15 +2021,122 @@ class FeatureExtractor:
 
 
 # ====================================================================================================
+# FEATURE EXPORT/IMPORT UTILITIES
+# ====================================================================================================
+
+
+class FeatureExporter:
+    """Handle export and import of features for cross-environment usage."""
+
+    @staticmethod
+    def export_features(
+        features_df: pd.DataFrame,
+        extractor,
+        labels: np.ndarray,
+        subjects: np.ndarray,
+        export_name: str = None,
+        compress: bool = True,
+    ) -> Path:
+        """Export features to portable format."""
+        if export_name is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_name = f"features_{FEATURE_VERSION}_{timestamp}"
+
+        export_path = EXPORT_DIR / export_name
+        export_path.mkdir(exist_ok=True)
+
+        print(f"\nExporting features to: {export_path}")
+
+        # Save features as Parquet
+        features_file = export_path / "features.parquet"
+        features_df.to_parquet(
+            features_file, compression="snappy" if compress else None, index=False
+        )
+        print(
+            f"  ✓ Features saved ({len(features_df)} samples, {len(features_df.columns)} features)"
+        )
+
+        # Save metadata
+        metadata = {
+            "labels": labels.tolist(),
+            "subjects": subjects.tolist(),
+            "n_samples": len(labels),
+            "n_features": len(features_df.columns),
+            "feature_names": list(features_df.columns),
+            "feature_version": FEATURE_VERSION,
+            "export_date": datetime.now().isoformat(),
+        }
+
+        with open(export_path / "metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        # Save extractor state
+        extractor_state = {
+            "scaler": extractor.scaler,
+            "tof_pcas": extractor.tof_pcas,
+            "feature_names": extractor.feature_names,
+            "config": extractor.config,
+            "is_fitted": extractor.is_fitted,
+        }
+        with open(export_path / "extractor.pkl", "wb") as f:
+            pickle.dump(extractor_state, f)
+
+        print(f"  ✓ Export complete: {export_path}")
+        return export_path
+
+    @staticmethod
+    def import_features(
+        import_path: str,
+    ) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, dict]:
+        """Import features from exported files."""
+        import_path = Path(import_path)
+
+        print(f"\nImporting features from: {import_path}")
+
+        # Load features
+        features_df = pd.read_parquet(import_path / "features.parquet")
+
+        # Load metadata
+        with open(import_path / "metadata.json", "r") as f:
+            metadata = json.load(f)
+
+        labels = np.array(metadata["labels"])
+        subjects = np.array(metadata["subjects"])
+
+        # Load extractor state
+        with open(import_path / "extractor.pkl", "rb") as f:
+            extractor_state = pickle.load(f)
+
+        print(
+            f"  ✓ Imported {features_df.shape[0]} samples, {features_df.shape[1]} features"
+        )
+        return features_df, labels, subjects, extractor_state
+
+
+# ====================================================================================================
 # MODEL TRAINING
 # ====================================================================================================
 
 
 def train_models():
-    """Train XGBoost models with cross-validation."""
+    """Train XGBoost models with cross-validation, with feature import/export."""
+    # Access global variables
+    global USE_EXPORTED_FEATURES, EXPORTED_FEATURES_PATH, EXPORT_FEATURES, EXPORT_NAME
+    
     print("\n" + "=" * 70)
     print("TRAINING PHASE")
     print("=" * 70)
+
+    # Display current settings
+    if USE_EXPORTED_FEATURES:
+        print("\n📥 Mode: IMPORT (using exported features)")
+        print(f"   Path: {EXPORTED_FEATURES_PATH}")
+    else:
+        print("\n🔄 Mode: EXTRACT (computing features from raw data)")
+        if EXPORT_FEATURES:
+            print(f"   Export: Enabled (name: {EXPORT_NAME or 'auto-generated'})")
+        else:
+            print("   Export: Disabled")
 
     # Load data using CONFIG paths
     print("\nLoading data...")
@@ -1990,12 +2178,63 @@ def train_models():
     labels = np.array(labels)
     subjects = np.array(subjects)
 
-    # Initialize feature extractor
-    extractor = FeatureExtractor(CONFIG)
+    # Check if we should import existing features
+    # Handle path adjustment for local environment
+    import_path = EXPORTED_FEATURES_PATH
+    if USE_EXPORTED_FEATURES and EXPORTED_FEATURES_PATH:
+        # If local and path doesn't exist, try adjusting the path
+        if not IS_KAGGLE_ENV and not Path(import_path).exists():
+            # Try to find the export in the local export directory
+            export_name = Path(EXPORTED_FEATURES_PATH).name
+            local_path = EXPORT_DIR / export_name
+            if local_path.exists():
+                import_path = str(local_path)
+                print(f"📂 Adjusted import path for local environment: {import_path}")
+            else:
+                print(f"⚠️ Warning: Export not found at {EXPORTED_FEATURES_PATH}")
+                print(f"   Also checked: {local_path}")
+                USE_EXPORTED_FEATURES = False
 
-    # Extract features
-    X = extractor.fit_transform(sequences, demographics, labels)
-    y = labels
+    if USE_EXPORTED_FEATURES and import_path and Path(import_path).exists():
+        print("\n📥 Loading exported features for fast training...")
+        X, labels, subjects, extractor_state = FeatureExporter.import_features(
+            import_path
+        )
+
+        # Reconstruct extractor from saved state
+        extractor = FeatureExtractor(CONFIG)
+        extractor.scaler = extractor_state["scaler"]
+        extractor.tof_pcas = extractor_state["tof_pcas"]
+        extractor.feature_names = extractor_state["feature_names"]
+        extractor.is_fitted = extractor_state["is_fitted"]
+        extractor.config = extractor_state["config"]
+
+        y = labels
+        print(f"  Features loaded in seconds! Shape: {X.shape}")
+    else:
+        # Extract features from scratch
+        print("\n🔄 Extracting features from raw data...")
+        print("  (This will take ~400s on first run)")
+
+        # Initialize feature extractor
+        extractor = FeatureExtractor(CONFIG)
+
+        # Extract features
+        X = extractor.fit_transform(sequences, demographics, labels)
+        y = labels
+
+        # Export features if requested
+        if EXPORT_FEATURES:
+            export_path = FeatureExporter.export_features(
+                X, extractor, labels, subjects, EXPORT_NAME
+            )
+            print(f"\n💾 Features exported for future use: {export_path}")
+            print("\n📝 To use these features in the future, set:")
+            print("   USE_EXPORTED_FEATURES = True")
+            if IS_KAGGLE_ENV:
+                print(f'   EXPORTED_FEATURES_PATH = "./{export_path.name}"')
+            else:
+                print(f'   EXPORTED_FEATURES_PATH = "{export_path}"')
 
     print(f"Feature matrix shape: {X.shape}")
 
@@ -2074,6 +2313,15 @@ def train_models():
     print("\nTop 20 Most Important Features:")
     print(feature_importance.head(20))
 
+    # Save models with export if features were exported
+    if EXPORT_NAME and EXPORT_FEATURES:
+        export_path = EXPORT_DIR / EXPORT_NAME
+        if export_path.exists():
+            model_file = export_path / f"models_{CONFIG['n_folds']}fold.pkl"
+            with open(model_file, "wb") as f:
+                pickle.dump(models, f)
+            print(f"\n✓ Models saved to: {model_file}")
+
     return models, extractor, mean_score
 
 
@@ -2123,14 +2371,60 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
 # ====================================================================================================
 
 if __name__ == "__main__":
-    # Use the environment detection from CONFIG
+    # Check and display available exports
+    print("\n" + "=" * 70)
+    print("AVAILABLE FEATURE EXPORTS")
     print("=" * 70)
-    print("KAGGLE ENVIRONMENT DETECTED")
-    print("=" * 70)
+
+    if EXPORT_DIR.exists():
+        exports = sorted(EXPORT_DIR.glob("features_*"))
+        if exports:
+            print("\nFound exported features:")
+            for exp in exports[-3:]:  # Show last 3 exports
+                if exp.is_dir():
+                    metadata_file = exp / "metadata.json"
+                    if metadata_file.exists():
+                        with open(metadata_file, "r") as f:
+                            meta = json.load(f)
+                        print(f"  📁 {exp.name}")
+                        print(
+                            f"     Samples: {meta.get('n_samples', '?')}, Features: {meta.get('n_features', '?')}"
+                        )
+            print("\n💡 To use exported features, set:")
+            print("   USE_EXPORTED_FEATURES = True")
+            if IS_KAGGLE_ENV:
+                print(f'   EXPORTED_FEATURES_PATH = "./{exports[-1].name}"')
+            else:
+                print(f'   EXPORTED_FEATURES_PATH = "{exports[-1]}"')
+        else:
+            print("No exported features found. First run will extract and export.")
 
     # Train models
     MODELS, EXTRACTOR, score = train_models()
     print(f"\n✓ Models trained with CV score: {score:.4f}")
+
+    # Show performance summary
+    print("\n" + "=" * 70)
+    print("PERFORMANCE SUMMARY")
+    print("=" * 70)
+    if USE_EXPORTED_FEATURES:
+        print("✅ Used exported features - execution time: ~30 seconds")
+    else:
+        print("✅ Extracted features from raw data - execution time: ~400 seconds")
+        if EXPORT_FEATURES:
+            print("   Features have been exported for future use.")
+            print("   Next run will be 10x faster with exported features!")
+
+    # Environment-specific completion message
+    print("\n" + "=" * 70)
+    if IS_KAGGLE_ENV:
+        print("KAGGLE SUBMISSION READY")
+    else:
+        print("LOCAL EXECUTION COMPLETE")
+        print(
+            "To use in Kaggle: Copy exported features to Kaggle and set IS_KAGGLE_ENV = True"
+        )
+    print("=" * 70)
 
     # Initialize Kaggle inference server
     print("\nInitializing Kaggle inference server...")
