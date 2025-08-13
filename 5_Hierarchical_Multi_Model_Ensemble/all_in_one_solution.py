@@ -1085,26 +1085,57 @@ if __name__ == "__main__":
 
         except ImportError as e:
             print(f"⚠️ Kaggle evaluation module not available: {e}")
-            print("Testing prediction function with dummy data...")
-
-            # Test with dummy data
-            test_seq = pl.DataFrame(
-                {
-                    "acc_x": np.random.randn(100),
-                    "acc_y": np.random.randn(100),
-                    "acc_z": np.random.randn(100),
-                    "rot_w": np.ones(100),
-                    "rot_x": np.zeros(100),
-                    "rot_y": np.zeros(100),
-                    "rot_z": np.zeros(100),
-                }
-            )
-            test_demo = pl.DataFrame({"age": [25]})
-
-            result = predict(test_seq, test_demo)
-            print(f"Test prediction: {result}")
-            assert result in GESTURE_MAPPER, "Invalid prediction"
-            print("✓ Test passed!")
+            print("Attempting manual submission generation...")
+            
+            # Try to generate submission manually
+            try:
+                test_path = "/kaggle/input/cmi-detect-behavior-with-sensor-data/test.csv"
+                if os.path.exists(test_path):
+                    print("Loading test data from Kaggle input...")
+                    test_df = pd.read_csv(test_path)
+                    test_demo_df = pd.read_csv("/kaggle/input/cmi-detect-behavior-with-sensor-data/test_demographics.csv")
+                    
+                    print(f"Processing {test_df['sequence_id'].nunique()} test sequences...")
+                    
+                    predictions = []
+                    sequence_ids = test_df['sequence_id'].unique()
+                    
+                    for i, seq_id in enumerate(sequence_ids):
+                        if i % 100 == 0:
+                            print(f"  Processed {i}/{len(sequence_ids)} sequences...")
+                        
+                        seq_df = test_df[test_df['sequence_id'] == seq_id]
+                        seq_pl = pl.from_pandas(seq_df)
+                        demo_pl = pl.from_pandas(test_demo_df[test_demo_df['sequence_id'] == seq_id])
+                        
+                        pred = predict(seq_pl, demo_pl)
+                        predictions.append({'sequence_id': seq_id, 'prediction': pred})
+                    
+                    submission_df = pd.DataFrame(predictions)
+                    submission_df.to_parquet('/kaggle/working/submission.parquet', index=False)
+                    print(f"\n✓ Generated submission.parquet with {len(submission_df)} predictions")
+                else:
+                    print("Testing prediction function with dummy data...")
+                    test_seq = pl.DataFrame(
+                        {
+                            "acc_x": np.random.randn(100),
+                            "acc_y": np.random.randn(100),
+                            "acc_z": np.random.randn(100),
+                            "rot_w": np.ones(100),
+                            "rot_x": np.zeros(100),
+                            "rot_y": np.zeros(100),
+                            "rot_z": np.zeros(100),
+                        }
+                    )
+                    test_demo = pl.DataFrame({"age": [25]})
+                    
+                    result = predict(test_seq, test_demo)
+                    print(f"Test prediction: {result}")
+                    assert result in GESTURE_MAPPER, "Invalid prediction"
+                    print("✓ Test passed!")
+                    
+            except Exception as manual_e:
+                print(f"⚠️ Manual submission generation failed: {manual_e}")
 
     else:
         print("=" * 70)
