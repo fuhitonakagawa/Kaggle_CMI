@@ -1,6 +1,6 @@
 # ====================================================================================================
 # CMI BFRB Detection - Deep Learning with 1D-CNN + BiLSTM + Attention
-# Version: 6.0 - Complete Deep Learning Implementation
+# Version: 6.1 - Fixed Learning Rate Schedule Conflict
 # Architecture: Residual SE-CNN + BiLSTM + GRU + Attention (Based on LB 0.77 model)
 # Score Target: 0.770+ (Binary F1: 0.94+, Macro F1: 0.60+)
 # ====================================================================================================
@@ -26,7 +26,7 @@ from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras import backend as K
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, Callback
 from tensorflow.keras.layers import (
     Input, Conv1D, BatchNormalization, Activation, add, MaxPooling1D, Dropout,
     Bidirectional, LSTM, GlobalAveragePooling1D, Dense, Multiply, Reshape,
@@ -55,13 +55,15 @@ def configure_gpu():
             if sys.platform == 'darwin':
                 print("✓ Metal GPU detected (Mac)")
                 # Metal doesn't require memory growth settings
-                policy = tf.keras.mixed_precision.Policy('mixed_float16')
-                tf.keras.mixed_precision.set_global_policy(policy)
-                print("  Mixed precision: enabled (float16 compute, float32 variables)")
+                # Disable mixed precision for stability
+                # policy = tf.keras.mixed_precision.Policy('mixed_float16')
+                # tf.keras.mixed_precision.set_global_policy(policy)
+                # print("  Mixed precision: enabled (float16 compute, float32 variables)")
             else:
                 # For NVIDIA GPUs
                 for gpu in gpus:
                     tf.config.experimental.set_memory_growth(gpu, True)
+                # Enable mixed precision for NVIDIA GPUs
                 policy = tf.keras.mixed_precision.Policy('mixed_float16')
                 tf.keras.mixed_precision.set_global_policy(policy)
                 print(f"✓ CUDA GPU configured: {len(gpus)} device(s) available")
@@ -107,7 +109,7 @@ CONFIG = {
     # Deep Learning parameters
     "batch_size": 64,
     "epochs": 150,
-    "patience": 30,
+    "patience": 40,
     "lr_init": 5e-4,
     "weight_decay": 3e-3,
     "mixup_alpha": 0.4,
@@ -264,8 +266,8 @@ def calculate_angular_velocity(rot: np.ndarray, sample_rate: int = 20) -> np.nda
             r_t_plus = R.from_quat(rot_scipy[i + 1])
             delta_rot = r_t.inv() * r_t_plus
             angular_vel[i, :] = delta_rot.as_rotvec() / time_delta
-        except:
-            pass
+        except (ValueError, ZeroDivisionError):
+            angular_vel[i, :] = 0
     
     if n_samples > 1:
         angular_vel[-1, :] = angular_vel[-2, :]
@@ -302,6 +304,52 @@ class MixupGenerator(Sequence):
     
     def on_epoch_end(self):
         np.random.shuffle(self.indices)
+
+# ====================================================================================================
+# CUSTOM LEARNING RATE SCHEDULER CALLBACK
+# ====================================================================================================
+
+class CustomLRScheduler(Callback):
+    """Custom learning rate scheduler that combines cosine decay with manual reduction on plateau."""
+    
+    def __init__(self, initial_lr, first_decay_steps, patience=10, factor=0.5, min_lr=1e-6, verbose=1):
+        super().__init__()
+        self.initial_lr = initial_lr
+        self.first_decay_steps = first_decay_steps
+        self.patience = patience
+        self.factor = factor
+        self.min_lr = min_lr
+        self.verbose = verbose
+        self.wait = 0
+        self.best = float('inf')
+        self.current_lr = initial_lr
+        
+    def on_epoch_begin(self, epoch, logs=None):
+        # Cosine decay
+        if epoch < self.first_decay_steps:
+            self.current_lr = self.initial_lr * 0.5 * (1 + np.cos(np.pi * epoch / self.first_decay_steps))
+        self.model.optimizer.learning_rate.assign(self.current_lr)
+        
+    def on_epoch_end(self, epoch, logs=None):
+        current = logs.get('val_loss')
+        if current is None:
+            return
+            
+        if current < self.best:
+            self.best = current
+            self.wait = 0
+        else:
+            self.wait += 1
+            if self.wait >= self.patience:
+                old_lr = float(self.model.optimizer.learning_rate.numpy())
+                if old_lr > self.min_lr:
+                    new_lr = old_lr * self.factor
+                    new_lr = max(new_lr, self.min_lr)
+                    self.model.optimizer.learning_rate.assign(new_lr)
+                    self.current_lr = new_lr
+                    if self.verbose > 0:
+                        print(f'\nEpoch {epoch+1}: reducing learning rate from {old_lr:.2e} to {new_lr:.2e}.')
+                    self.wait = 0
 
 # ====================================================================================================
 # DEEP LEARNING MODEL ARCHITECTURE
@@ -436,7 +484,7 @@ def prepare_sequences_for_dl(df, demo_df, sequence_ids, gesture_mapper=None):
         
         # Basic IMU features
         acc_data = seq_data[['acc_x', 'acc_y', 'acc_z']].fillna(0).values
-        rot_data = seq_data[['rot_w', 'rot_x', 'rot_y', 'rot_z']].fillna(method='ffill').fillna(1).values
+        rot_data = seq_data[['rot_w', 'rot_x', 'rot_y', 'rot_z']].ffill().bfill().fillna(1).values
         
         # Remove gravity to get linear acceleration
         linear_acc = remove_gravity_from_acc(acc_data, rot_data[:, [1, 2, 3, 0]])
@@ -630,23 +678,20 @@ def train_deep_learning_model():
         )
         print("✓ IMU-only model created")
     
-    # Learning rate schedule
-    steps_per_epoch = len(X_tr) // CONFIG['batch_size']
-    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
-        CONFIG['lr_init'],
-        first_decay_steps=15 * steps_per_epoch,
-        t_mul=2.0,
-        m_mul=0.9
-    )
+    # Use fixed learning rate instead of schedule
+    # This avoids the conflict with ReduceLROnPlateau
+    optimizer = Adam(learning_rate=CONFIG['lr_init'])
     
     # Compile model
     model.compile(
-        optimizer=Adam(lr_schedule),
+        optimizer=optimizer,
         loss=tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
         metrics=['accuracy']
     )
     
-    # Callbacks
+    # Callbacks - using custom LR scheduler instead of ReduceLROnPlateau
+    steps_per_epoch = len(X_tr) // CONFIG['batch_size']
+    
     callbacks = [
         EarlyStopping(
             monitor='val_accuracy',
@@ -655,10 +700,11 @@ def train_deep_learning_model():
             verbose=1,
             mode='max'
         ),
-        ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=0.5,
+        CustomLRScheduler(
+            initial_lr=CONFIG['lr_init'],
+            first_decay_steps=15,  # epochs for cosine decay
             patience=10,
+            factor=0.5,
             min_lr=1e-6,
             verbose=1
         ),
@@ -754,19 +800,37 @@ def predict_for_submission(sequence: pl.DataFrame, demographics: pl.DataFrame,
                           model, scaler, pad_len, imu_dim, tof_thm_dim):
     """Prediction function for Kaggle submission."""
     try:
-        # Convert to pandas
-        seq_df = sequence.to_pandas() if isinstance(sequence, pl.DataFrame) else sequence
-        demo_df = demographics.to_pandas() if isinstance(demographics, pl.DataFrame) else demographics
+        # Convert to pandas if needed
+        if isinstance(sequence, pl.DataFrame):
+            seq_df = sequence.to_pandas()
+        else:
+            seq_df = sequence
+            
+        if isinstance(demographics, pl.DataFrame):
+            demo_df = demographics.to_pandas()
+        else:
+            demo_df = demographics
+        
+        # Get sequence ID
+        if 'sequence_id' in seq_df.columns:
+            seq_ids = seq_df['sequence_id'].unique()
+        else:
+            # Generate a temporary sequence ID if not present
+            seq_df['sequence_id'] = 'temp_seq'
+            seq_ids = ['temp_seq']
+        
+        # Ensure subject column exists
+        if 'subject' not in seq_df.columns:
+            seq_df['subject'] = 'unknown'
         
         # Prepare single sequence
         sequences, _, _ = prepare_sequences_for_dl(
-            seq_df, demo_df, 
-            seq_df['sequence_id'].unique() if 'sequence_id' in seq_df.columns else ['unknown'],
-            None
+            seq_df, demo_df, seq_ids, None
         )
         
         if not sequences:
-            return "Text on phone"  # Default prediction
+            print("Warning: No sequences prepared, returning default prediction")
+            return "Text on phone"  # Default safe prediction
         
         # Pad sequence
         X = pad_sequences_custom(sequences, maxlen=pad_len, padding='post', truncating='post')
@@ -780,11 +844,15 @@ def predict_for_submission(sequence: pl.DataFrame, demographics: pl.DataFrame,
         pred_probs = model.predict(X, verbose=0)
         pred_class = pred_probs.argmax(axis=1)[0]
         
-        return REVERSE_GESTURE_MAPPER[pred_class]
+        # Return gesture name
+        gesture_name = REVERSE_GESTURE_MAPPER[pred_class]
+        return gesture_name
         
     except Exception as e:
-        print(f"Prediction error: {e}")
-        return "Text on phone"  # Default prediction
+        print(f"ERROR in prediction: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return "Text on phone"  # Default safe prediction
 
 # ====================================================================================================
 # MAIN EXECUTION
@@ -828,63 +896,41 @@ if __name__ == "__main__":
             imu_dim = 16  # Fixed
             tof_thm_dim = model.input_shape[-1] - imu_dim
         
-        # Create prediction function
+        # Create prediction function for Kaggle
         def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
+            """Main prediction function required by Kaggle."""
             return predict_for_submission(
                 sequence, demographics, model, scaler, pad_len, imu_dim, tof_thm_dim
             )
         
-        # Test prediction
-        print("\nTesting prediction function...")
-        test_seq = pl.DataFrame({
-            'acc_x': np.random.randn(100),
-            'acc_y': np.random.randn(100),
-            'acc_z': np.random.randn(100),
-            'rot_w': np.ones(100),
-            'rot_x': np.zeros(100),
-            'rot_y': np.zeros(100),
-            'rot_z': np.zeros(100),
-            'subject': ['test'] * 100,
-            'sequence_id': ['test_seq'] * 100,
-        })
-        test_demo = pl.DataFrame({
-            'age': [25],
-            'adult_child': [1],
-            'sex': [0],
-            'handedness': [1]
-        })
+        print("✓ Prediction function created")
         
-        test_result = predict(test_seq, test_demo)
-        print(f"Test prediction: {test_result}")
-        assert test_result in GESTURE_MAPPER, "Invalid prediction"
-        print("✓ Test passed!")
+        # Initialize inference server - REQUIRED for Kaggle submission
+        print("\n" + "="*60)
+        print("KAGGLE INFERENCE SERVER INITIALIZATION")
+        print("="*60)
         
-        # Initialize inference server
-        sys.path.append("/kaggle/input/cmi-detect-behavior-with-sensor-data")
-        try:
-            import kaggle_evaluation.cmi_inference_server
-            
-            print("\nInitializing CMI inference server...")
-            inference_server = kaggle_evaluation.cmi_inference_server.CMIInferenceServer(predict)
-            print("✓ Inference server initialized")
-            
-            # Run inference
-            if os.getenv("KAGGLE_IS_COMPETITION_RERUN"):
-                print("Competition environment - serving predictions...")
-                inference_server.serve()
-            else:
-                print("Local testing mode...")
-                inference_server.run_local_gateway(
-                    data_paths=(
-                        CONFIG["data_path"] + "test.csv",
-                        CONFIG["data_path"] + "test_demographics.csv",
-                    )
-                )
-                print("✓ Inference complete!")
-                
-        except ImportError as e:
-            print(f"Could not import CMI inference server: {e}")
-            print("This is normal if running locally without the CMI package.")
+        # Import the CMI inference server module
+        # This is provided by Kaggle in the competition environment
+        from kaggle_evaluation.cmi_inference_server import CMIInferenceServer
+        
+        print("✓ CMI module imported successfully")
+        print("Creating inference server with predict function...")
+        
+        # Create the inference server with our predict function
+        inference_server = CMIInferenceServer(predict)
+        print("✓ Inference server created")
+        
+        # Start serving predictions
+        print("\nStarting inference server...")
+        print("This will process test data and create submission.parquet")
+        
+        # The serve() method is required for actual competition submission
+        # It will be called automatically by Kaggle's infrastructure
+        inference_server.serve()
+        
+        print("✓ Inference server is running")
+        print("="*60)
     else:
         # Local training and testing
         print("Running in local environment")

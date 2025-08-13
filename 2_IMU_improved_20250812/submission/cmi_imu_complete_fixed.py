@@ -2,7 +2,7 @@
 """
 CMI BFRB Detection - IMU Improved Model
 Complete Training and Inference Pipeline
-Version: 2.0.0
+Version: 2.1.0 - Fixed for Kaggle Submission
 Date: 2025-01-12
 """
 
@@ -20,6 +20,7 @@ import pandas as pd
 import polars as pl
 from scipy import stats
 from scipy.signal import find_peaks, welch
+from scipy.spatial.transform import Rotation as R
 from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
@@ -31,10 +32,10 @@ warnings.filterwarnings('ignore')
 # ======================== Configuration ========================
 
 # Paths
-IS_KAGGLE = '/kaggle' in os.getcwd()
+IS_KAGGLE = '/kaggle' in os.getcwd() or os.path.exists('/kaggle/input')
 if IS_KAGGLE:
     DATA_PATH = '/kaggle/input/cmi-detect-behavior-with-sensor-data/'
-    MODEL_PATH = '/kaggle/working/models/'
+    MODEL_PATH = '/kaggle/working/'
     OUTPUT_PATH = '/kaggle/working/'
 else:
     DATA_PATH = '../cmi-detect-behavior-with-sensor-data/'
@@ -523,9 +524,10 @@ def main():
     print('=' * 50)
     
     # Check if we're in training or inference mode
+    # IMPORTANT: In Kaggle submission environment, KAGGLE_IS_COMPETITION_RERUN is set
     if os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
         # ========== Inference Mode ==========
-        print('Running in INFERENCE mode')
+        print('Running in INFERENCE mode (Competition Environment)')
         
         # Load pre-trained models
         print('Loading models...')
@@ -540,10 +542,31 @@ def main():
             feature_cols = model_data['feature_columns']
             print(f'Loaded {len(lgb_models)} LightGBM and {len(xgb_models)} XGBoost models')
         else:
-            print('ERROR: Model file not found!')
-            lgb_models = []
-            xgb_models = []
-            feature_cols = []
+            print('ERROR: Model file not found! Looking for alternative paths...')
+            # Try alternative paths
+            alternative_paths = [
+                '/kaggle/input/cmi-imu-models/model_data.pkl',
+                '/kaggle/working/model_data.pkl',
+                './model_data.pkl'
+            ]
+            
+            model_loaded = False
+            for alt_path in alternative_paths:
+                if os.path.exists(alt_path):
+                    print(f'Found model at: {alt_path}')
+                    with open(alt_path, 'rb') as f:
+                        model_data = pickle.load(f)
+                    lgb_models = model_data['lgb_models']
+                    xgb_models = model_data['xgb_models']
+                    feature_cols = model_data['feature_columns']
+                    model_loaded = True
+                    break
+            
+            if not model_loaded:
+                print('CRITICAL ERROR: No model file found!')
+                lgb_models = []
+                xgb_models = []
+                feature_cols = []
         
         # Initialize inference server
         print('Initializing inference server...')
@@ -554,9 +577,12 @@ def main():
         print('Serving predictions...')
         inference_server.serve()
         
+        print('\n========== Inference Complete ==========')
+        print('Note: submission.parquet is generated automatically by Kaggle')
+        
     else:
-        # ========== Training Mode ==========
-        print('Running in TRAINING mode')
+        # ========== Training/Local Mode ==========
+        print('Running in TRAINING/LOCAL mode')
         
         # Load training data
         print('\nLoading data...')
@@ -633,32 +659,53 @@ def main():
         print(f'\nModels saved to {MODEL_PATH}')
         print('\n========== Training Complete ==========')
         
-        # Test inference function
-        print('\nTesting inference function...')
-        lgb_models = model_results['lgb_models']
-        xgb_models = model_results['xgb_models']
-        feature_cols = model_results['feature_columns']
+        # Test inference locally if not in Kaggle
+        if not IS_KAGGLE:
+            print('\nTesting inference function...')
+            lgb_models = model_results['lgb_models']
+            xgb_models = model_results['xgb_models']
+            feature_cols = model_results['feature_columns']
+            
+            test_seq = pl.DataFrame({
+                'acc_x': np.random.randn(100),
+                'acc_y': np.random.randn(100),
+                'acc_z': np.random.randn(100),
+                'rot_w': np.random.randn(100),
+                'rot_x': np.random.randn(100),
+                'rot_y': np.random.randn(100),
+                'rot_z': np.random.randn(100)
+            })
+            test_demo = pl.DataFrame({
+                'age': [25],
+                'adult_child': [1],
+                'sex': [0],
+                'handedness': [1]
+            })
+            
+            result = predict(test_seq, test_demo)
+            print(f'Test prediction: {result}')
+            assert isinstance(result, str) and result in GESTURE_MAPPER, 'Invalid prediction!'
+            print('Inference test passed!')
         
-        test_seq = pl.DataFrame({
-            'acc_x': np.random.randn(100),
-            'acc_y': np.random.randn(100),
-            'acc_z': np.random.randn(100),
-            'rot_w': np.random.randn(100),
-            'rot_x': np.random.randn(100),
-            'rot_y': np.random.randn(100),
-            'rot_z': np.random.randn(100)
-        })
-        test_demo = pl.DataFrame({
-            'age': [25],
-            'adult_child': [1],
-            'sex': [0],
-            'handedness': [1]
-        })
-        
-        result = predict(test_seq, test_demo)
-        print(f'Test prediction: {result}')
-        assert isinstance(result, str) and result in GESTURE_MAPPER, 'Invalid prediction!'
-        print('Inference test passed!')
+        # If in Kaggle but not in competition environment, run local gateway
+        elif IS_KAGGLE and not os.getenv('KAGGLE_IS_COMPETITION_RERUN'):
+            print('\nRunning local gateway for testing...')
+            lgb_models = model_results['lgb_models']
+            xgb_models = model_results['xgb_models']
+            feature_cols = model_results['feature_columns']
+            
+            sys.path.append('/kaggle/input/cmi-detect-behavior-with-sensor-data')
+            import kaggle_evaluation.cmi_inference_server
+            
+            inference_server = kaggle_evaluation.cmi_inference_server.CMIInferenceServer(predict)
+            inference_server.run_local_gateway(
+                data_paths=(
+                    os.path.join(DATA_PATH, 'test.csv'),
+                    os.path.join(DATA_PATH, 'test_demographics.csv'),
+                )
+            )
+            print('\n✓ Local test complete!')
+            print('✓ submission.parquet has been generated for local testing')
     
     print('\n========== Process Complete ==========')
 
