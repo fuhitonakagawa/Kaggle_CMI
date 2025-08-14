@@ -3,15 +3,6 @@
 # CMI-BFRB検出: 高度な特徴量エンジニアリングとXGBoost v2.0
 # ====================================================================================================
 #
-# 📌 バージョン2.0の主な改善点:
-# --------------------------------
-# • CVリーク対策: fold内でScaler/PCAをfitし、真の汎化性能を評価
-# • ToF-PCA修正: 全訓練データでfit、各シーケンスでtransformのみ実行
-# • 周波数特徴改善: 短系列対応（動的nperseg）、相対パワー・対数パワー追加
-# • Quality特徴追加: データ品質メトリクス（連続欠測長、有効率など）
-# • 推論安定化: predict()でモデルロードのみ（学習なし）でタイムアウト防止
-# • バグ修正: ToF同期特徴、領域マスク、Noneハンドリングを改善
-#
 # 📊 使用方法:
 # -----------
 # Kaggle環境:
@@ -140,10 +131,10 @@ USE_PARALLEL = True  # True: 並列処理を使用（ローカル環境のみ有
 N_JOBS = -1  # 並列処理のワーカー数 (-1: 全コア使用, 正の整数: 指定数のコア使用)
 
 # 🔧 学習済モデル設定
-USE_PRETRAINED_MODEL = True  # True: 学習済モデルをロード、False: 新規に学習
-PRETRAINED_MODEL_PATH = "/kaggle/input/cmi-bfrb-v6-2-xgboost/other/default/1/models.pkl"  # 学習済モデルファイルのパス（None = 自動検出）
-PRETRAINED_EXTRACTOR_PATH = "/kaggle/input/cmi-bfrb-v6-2-xgboost/other/default/1/extractor.pkl"  # 学習済Extractorファイルのパス（None = 自動検出）
-PRETRAINED_ARTIFACTS_PATH = "/kaggle/input/cmi-bfrb-v6-2-xgboost/other/default/1/fold_artifacts.pkl"  # fold artifactsファイルのパス（None = 自動検出）
+USE_PRETRAINED_MODEL = False  # True: 学習済モデルをロード、False: 新規に学習
+PRETRAINED_MODEL_PATH = None  # 学習済モデルファイルのパス（None = 自動検出）
+PRETRAINED_EXTRACTOR_PATH = None  # 学習済Extractorファイルのパス（None = 自動検出）
+PRETRAINED_ARTIFACTS_PATH = None  # fold artifactsファイルのパス（None = 自動検出）
 EXPORT_TRAINED_MODEL = True  # True: 学習後にモデルをエクスポート
 
 # 💾 チェックポイント設定
@@ -151,6 +142,9 @@ USE_CHECKPOINT = False  # True: チェックポイントから再開、False: �
 CHECKPOINT_DIR = "checkpoints"  # チェックポイント保存ディレクトリ
 CHECKPOINT_INTERVAL = 1  # 何fold毎にチェックポイントを保存するか（1=毎fold）
 AUTO_REMOVE_CHECKPOINT = True  # 学習完了時に自動的にチェックポイントを削除
+
+# 🔧 fold毎のアーティファクト（スケーラーなど）
+FOLD_ARTIFACTS = None  # fold毎のスケーラーとメタデータ
 
 # 環境に応じてエクスポート済み特徴量のパスを自動設定
 if IS_KAGGLE_ENV:
@@ -264,6 +258,16 @@ CONFIG = {
     # Normalization
     "sequence_normalize": True,
     "robust_scaler": True,
+    # 🔧 T1: NaN保持 & スケーラ停止
+    "preserve_nan_for_missing": True,  # 欠損をNaNのまま保持（XGBoostのmissing分岐を活用）
+    "use_scaler_for_xgb": False,  # XGBoost時はスケーラ無効（樹木系はスケール不要）
+    # 🔧 T5: 非IMUの計算スキップ（低品質時）
+    "quality_thresholds": {"tof": 0.05, "thm": 0.05},  # 品質闾値
+    # 🔧 T4: スマート窓
+    "smart_windowing": True,  # エネルギー最大窓を使用
+    "topk_windows": 1,  # Top-k windows to use
+    # 🔧 T7: モダリティ・ドロップアウト
+    "modality_dropout_prob": 0.4,  # 学習時のモダリティドロップアウト確率
     # Model
     "n_folds": 5,
     "random_state": 42,
@@ -358,11 +362,24 @@ def compute_world_acceleration(acc: np.ndarray, rot: np.ndarray) -> np.ndarray:
     return acc_world
 
 
+def robust_normalize(x: np.ndarray) -> np.ndarray:
+    """
+    🔧 T3: ロバスト正規化（中央値/IQR）
+    外れ値に頑健な正規化を行う。
+    """
+    med = np.nanmedian(x)
+    iqr = np.nanpercentile(x, 75) - np.nanpercentile(x, 25)
+    return (x - med) / (iqr + 1e-8)
+
+
 def compute_linear_acceleration(
-    acc: np.ndarray, rot: np.ndarray, method: str = "subtract"
+    acc: np.ndarray, rot: np.ndarray = None, method: str = "subtract"
 ) -> np.ndarray:
-    """Remove gravity from acceleration to get linear acceleration."""
-    if method == "subtract":
+    """
+    Remove gravity from acceleration to get linear acceleration.
+    🔧 T3: クォータニオンなし時のフォールバック追加
+    """
+    if method == "subtract" and rot is not None:
         # Method A: Subtract gravity in world coordinates
         acc_world = compute_world_acceleration(acc, rot)
         gravity_world = np.array([0, 0, CONFIG["gravity"]])
@@ -896,6 +913,26 @@ def extract_quality_features(
     total_rows = len(sequence_df)
     features[f"{prefix}_sequence_length"] = total_rows
 
+    # 🔧 T2: 品質・可用性フラグ（モダリティ有無をモデルに明示）
+    # IMU有無の判定
+    features[f"{prefix}_has_imu"] = int(
+        all(c in sequence_df.columns for c in ["acc_x", "acc_y", "acc_z"])
+    )
+
+    # クォータニオン有無の判定
+    features[f"{prefix}_has_quat"] = int(len(detect_quat_cols(sequence_df)) > 0)
+
+    # ToF有無の判定
+    features[f"{prefix}_has_tof"] = int(
+        any(c.startswith("tof_") for c in sequence_df.columns)
+    )
+
+    # サーマル有無の判定
+    tp = detect_thermal_prefix(sequence_df)
+    features[f"{prefix}_has_thermal"] = int(
+        any(c.startswith(tp) for c in sequence_df.columns) if tp else 0
+    )
+
     # IMUデータの品質
     for axis in ["x", "y", "z"]:
         if f"acc_{axis}" in sequence_df.columns:
@@ -920,6 +957,16 @@ def extract_quality_features(
                     features[f"{prefix}_acc_{axis}_max_consecutive_nan"] = 0
             else:
                 features[f"{prefix}_acc_{axis}_max_consecutive_nan"] = 0
+
+    # 🔧 T2: IMUの有効サンプル比（列単位→平均）
+    acc_valid = []
+    for axis in ["x", "y", "z"]:
+        if f"acc_{axis}" in sequence_df.columns:
+            v = sequence_df[f"acc_{axis}"].values
+            acc_valid.append(1 - np.mean(np.isnan(v)))
+    features[f"{prefix}_imu_valid_ratio_mean"] = (
+        float(np.mean(acc_valid)) if acc_valid else 0.0
+    )
 
     # Quaternionデータの品質
     quat_cols = ["quat_w", "quat_x", "quat_y", "quat_z"]
@@ -960,6 +1007,24 @@ def extract_quality_features(
             features[f"{prefix}_tof_{sensor_id}_invalid_frame_ratio"] = np.mean(
                 valid_ratios == 0
             )
+
+    # 🔧 T2: ToF全体の集約品質メトリクス
+    all_tof_valid_ratios = []
+    for sensor_id in range(5):
+        if f"{prefix}_tof_{sensor_id}_valid_ratio_mean" in features:
+            all_tof_valid_ratios.append(
+                features[f"{prefix}_tof_{sensor_id}_valid_ratio_mean"]
+            )
+
+    if all_tof_valid_ratios:
+        features[f"{prefix}_tof_all_valid_ratio_mean"] = np.mean(all_tof_valid_ratios)
+        features[f"{prefix}_tof_all_valid_ratio_min"] = np.min(all_tof_valid_ratios)
+        features[f"{prefix}_tof_all_valid_ratio_p25"] = np.percentile(
+            all_tof_valid_ratios, 25
+        )
+        features[f"{prefix}_tof_all_valid_ratio_p75"] = np.percentile(
+            all_tof_valid_ratios, 75
+        )
 
     # Thermalデータの品質
     thermal_cols = [c for c in sequence_df.columns if c.startswith("therm_")]
@@ -1727,7 +1792,10 @@ def extract_cross_modal_sync_features(
 
 
 def extract_multi_resolution_features(sequence_df: pd.DataFrame, config: dict) -> dict:
-    """Extract features from multiple time windows (S/M/L) with Temporal Pyramid."""
+    """
+    Extract features from multiple time windows (S/M/L) with Temporal Pyramid.
+    🔧 T4: スマート窓（エネルギー最大窓）の実装
+    """
     features = {}
 
     if not config.get("use_multi_resolution", False):
@@ -1738,6 +1806,16 @@ def extract_multi_resolution_features(sequence_df: pd.DataFrame, config: dict) -
         "window_sizes", {"S": (20, 30), "M": (60, 80), "L": (200, 256)}
     )
 
+    # 🔧 T4: スマート窓の実装（エネルギー最大窓）
+    # 加速度マグニチュードをエネルギー指標として使用
+    base = None
+    if all(f"acc_{a}" in sequence_df.columns for a in ["x", "y", "z"]):
+        base = np.sqrt(
+            sequence_df["acc_x"] ** 2
+            + sequence_df["acc_y"] ** 2
+            + sequence_df["acc_z"] ** 2
+        ).values
+
     # For each window size
     for window_name, (min_size, max_size) in window_sizes.items():
         # Determine actual window size based on sequence length
@@ -1746,14 +1824,34 @@ def extract_multi_resolution_features(sequence_df: pd.DataFrame, config: dict) -
 
         window_size = min(max_size, seq_len)
 
-        # 末尾ウィンドウを抽出（予測用に強調）
-        if config.get("use_tail_emphasis", True):
-            start_idx = max(0, seq_len - window_size)
-            window_df = sequence_df.iloc[start_idx:]
+        if base is not None and config.get("smart_windowing", True):
+            # 🔧 T4: エネルギー最大窓を見つける
+            # 移動RMSを計算してエネルギーが最大の位置を特定
+            s = pd.Series(base)
+            rms = s.rolling(window_size, min_periods=max(8, window_size // 5)).apply(
+                lambda v: np.sqrt(np.mean(v**2))
+            )
+
+            if not rms.isna().all():
+                # RMS最大位置を中心とした窓を取得
+                center_idx = int(np.nanargmax(rms.values))
+                start_idx = max(
+                    0, min(center_idx - window_size // 2, seq_len - window_size)
+                )
+                window_df = sequence_df.iloc[start_idx : start_idx + window_size]
+            else:
+                # フォールバック：末尾窓を使用
+                start_idx = max(0, seq_len - window_size)
+                window_df = sequence_df.iloc[start_idx:]
         else:
-            # Use middle window
-            start_idx = max(0, (seq_len - window_size) // 2)
-            window_df = sequence_df.iloc[start_idx : start_idx + window_size]
+            # 従来の処理：末尾ウィンドウを抽出（予測用に強調）
+            if config.get("use_tail_emphasis", True):
+                start_idx = max(0, seq_len - window_size)
+                window_df = sequence_df.iloc[start_idx:]
+            else:
+                # Use middle window
+                start_idx = max(0, (seq_len - window_size) // 2)
+                window_df = sequence_df.iloc[start_idx : start_idx + window_size]
 
         # このウィンドウの基本統計量を抽出
         for col in ["acc_x", "acc_y", "acc_z"]:
@@ -1846,6 +1944,80 @@ def detect_tof_sensor_ids(df: pd.DataFrame) -> List[int]:
     return sorted(ids) if ids else list(range(5))  # デフォルトは0-4
 
 
+# ========================================
+# チェックポイント関数
+# ========================================
+
+
+def save_checkpoint(
+    fold: int, model, feature_names: list, scaler, fold_artifacts: list
+):
+    """チェックポイントを保存"""
+    if not USE_CHECKPOINT:
+        return
+
+    checkpoint_dir = Path(CHECKPOINT_DIR)
+    checkpoint_dir.mkdir(exist_ok=True)
+
+    checkpoint_file = checkpoint_dir / f"checkpoint_fold_{fold}.pkl"
+    checkpoint_data = {
+        "fold": fold,
+        "model": model,
+        "feature_names": feature_names,
+        "scaler": scaler,
+        "fold_artifacts": fold_artifacts,
+    }
+
+    with open(checkpoint_file, "wb") as f:
+        pickle.dump(checkpoint_data, f)
+
+    print(f"  💾 Checkpoint saved: fold {fold}")
+
+
+def load_checkpoint():
+    """チェックポイントから再開"""
+    if not USE_CHECKPOINT:
+        return None, None, 0
+
+    checkpoint_dir = Path(CHECKPOINT_DIR)
+    if not checkpoint_dir.exists():
+        return None, None, 0
+
+    checkpoint_files = sorted(checkpoint_dir.glob("checkpoint_fold_*.pkl"))
+    if not checkpoint_files:
+        return None, None, 0
+
+    # 最新のチェックポイントを読み込み
+    models = []
+    fold_artifacts = []
+    last_fold = -1
+
+    for cp_file in checkpoint_files:
+        with open(cp_file, "rb") as f:
+            cp_data = pickle.load(f)
+        models.append(cp_data["model"])
+        fold_artifacts.append(
+            {"feature_names": cp_data["feature_names"], "scaler": cp_data["scaler"]}
+        )
+        last_fold = max(last_fold, cp_data["fold"])
+
+    print(f"✅ Checkpoint loaded: Resuming from fold {last_fold + 1}")
+    return models, fold_artifacts, last_fold + 1
+
+
+def remove_checkpoints():
+    """チェックポイントファイルを削除"""
+    if not AUTO_REMOVE_CHECKPOINT:
+        return
+
+    checkpoint_dir = Path(CHECKPOINT_DIR)
+    if checkpoint_dir.exists():
+        import shutil
+
+        shutil.rmtree(checkpoint_dir)
+        print("🗑️ Checkpoints removed")
+
+
 def fill_series_nan(x: np.ndarray) -> np.ndarray:
     """NaN値を前方補完→後方補完→0で埋める。"""
     series = pd.Series(x)
@@ -1856,6 +2028,25 @@ def extract_features_parallel(args):
     """Global function for parallel feature extraction (used only in local environment)."""
     extractor, seq_df, demo_df = args
     return extractor.extract_features(seq_df, demo_df)
+
+
+# ========================================
+# ヘルパー関数
+# ========================================
+
+
+def _to01_handedness(v):
+    """handednessをR/L文字列から1/0に変換"""
+    if isinstance(v, str):
+        v = v.strip().lower()
+        if v.startswith("r"):
+            return 1
+        if v.startswith("l"):
+            return 0
+    try:
+        return int(v)
+    except:
+        return 0
 
 
 class FeatureExtractor:
@@ -1996,19 +2187,76 @@ class FeatureExtractor:
 
         X = pd.concat(feature_dfs, ignore_index=True)
 
-        # 列アライメント: fit時の列と一致させる
-        # 不足列は0で補い、余剰列は削除し、順序を揃える
+        # 🔧 T1: 列アライメント（NaN保持）
+        # 不足列はNaNで補い、余剰列は削除し、順序を揃える
         for col in self.feature_names:
             if col not in X.columns:
-                X[col] = 0
+                X[col] = np.nan  # T1: 欠損はNaNのまま保持
         X = X[self.feature_names]  # fit時の列順序に合わせる
 
-        # スケーリング
-        if self.scaler is not None:
+        # 🔧 T1: スケーリングの条件付き適用
+        if self.scaler is not None and self.config.get("use_scaler_for_xgb", True):
             X_scaled = self.scaler.transform(X)
             X = pd.DataFrame(X_scaled, columns=self.feature_names)
 
         return X
+
+    def _extract_features_raw(
+        self, seq_df: pd.DataFrame, demo_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """生の特徴量を抽出（スケーリング前）"""
+        # 単一のシーケンスに対して特徴抽出
+        features = {}
+
+        # ToFの前処理
+        tof_cols = [c for c in seq_df.columns if c.startswith("tof_")]
+        if tof_cols and "handedness" in demo_df.columns:
+            handedness = demo_df["handedness"].iloc[0] if len(demo_df) > 0 else 0
+            seq_df = mirror_tof_by_handedness(seq_df, handedness)
+
+        # IMU特徴
+        if self.config.get("use_imu_features", True):
+            # 四元数列を検出
+            quat_cols = detect_quat_cols(seq_df)
+
+            # 基本的なIMU特徴
+            for col in ["accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"]:
+                if col in seq_df.columns:
+                    data = seq_df[col].values
+                    feat_dict = extract_statistical_features(data, prefix=f"{col}_")
+                    features.update(feat_dict)
+
+            # 世界座標系の加速度
+            if quat_cols and all(
+                c in seq_df.columns for c in ["accel_x", "accel_y", "accel_z"]
+            ):
+                try:
+                    world_accel = compute_world_acceleration(seq_df, quat_cols)
+                    for i, axis in enumerate(["x", "y", "z"]):
+                        feat_dict = extract_statistical_features(
+                            world_accel[:, i], prefix=f"world_accel_{axis}_"
+                        )
+                        features.update(feat_dict)
+                except:
+                    pass
+
+        # ToF特徴
+        if self.config.get("use_tof_features", True) and tof_cols:
+            # 基本的なToF特徴
+            for col in tof_cols[:5]:  # 最初の5センサー
+                data = seq_df[col].values
+                feat_dict = extract_statistical_features(data, prefix=f"{col}_")
+                features.update(feat_dict)
+
+        # デモグラフィック特徴
+        if self.config.get("use_demographic_features", True):
+            for col in demo_df.columns:
+                if col != "subject":
+                    features[f"demo_{col}"] = (
+                        demo_df[col].iloc[0] if len(demo_df) > 0 else 0
+                    )
+
+        return pd.DataFrame([features])
 
     def fit_transform(
         self,
@@ -2023,396 +2271,15 @@ class FeatureExtractor:
         return self.transform(sequences, demographics)
 
     def _extract_features_raw(
-        self, sequence_df: pd.DataFrame, demographics_df: pd.DataFrame
+        self, seq_df: pd.DataFrame, demo_df: pd.DataFrame
     ) -> pd.DataFrame:
+        """生の特徴量を抽出（スケーリング前）
+
+        extract_featuresと同じ特徴量を生成する（PCA/スケーリングなし）
         """
-        生の特徴量を抽出（PCA/スケーリングなし）。
-        fit()内部で使用。ToF-PCAは適用しない。
-        """
-        features = {}
-
-        # Demographic features (subjectは除外)
-        # features["subject"] = demographics_df["subject"].iloc[0]  # 未知subject汎化のため除外
-        features["age"] = demographics_df["age"].iloc[0]
-        features["handedness"] = demographics_df["handedness"].iloc[0]
-
-        # Quality features（データ品質メトリクス）
-        quality_features = extract_quality_features(sequence_df)
-        features.update(quality_features)
-
-        # ① IMU features (Accelerometer, Quaternion, World/Linear acceleration, Angular velocity, Euler)
-        for axis in ["x", "y", "z"]:
-            # Raw accelerometer
-            if f"acc_{axis}" in sequence_df.columns:
-                # NaN処理: ffill→bfill→0
-                acc_data = fill_series_nan(sequence_df[f"acc_{axis}"].values)
-                features.update(extract_statistical_features(acc_data, f"acc_{axis}"))
-                features.update(extract_hjorth_parameters(acc_data, f"acc_{axis}"))
-                features.update(extract_peak_features(acc_data, f"acc_{axis}"))
-                features.update(extract_line_length(acc_data, f"acc_{axis}"))
-                features.update(extract_autocorrelation(acc_data, f"acc_{axis}"))
-                features.update(extract_gradient_histogram(acc_data, f"acc_{axis}"))
-
-                # ⑤ Frequency features
-                features.update(extract_frequency_features(acc_data, f"acc_{axis}"))
-
-        # Acceleration magnitude
-        if all(f"acc_{axis}" in sequence_df.columns for axis in ["x", "y", "z"]):
-            acc_mag = np.sqrt(
-                sequence_df["acc_x"] ** 2
-                + sequence_df["acc_y"] ** 2
-                + sequence_df["acc_z"] ** 2
-            )
-            features.update(extract_statistical_features(acc_mag, "acc_mag"))
-            features.update(extract_hjorth_parameters(acc_mag, "acc_mag"))
-            features.update(extract_peak_features(acc_mag, "acc_mag"))
-            features.update(extract_frequency_features(acc_mag, "acc_mag"))
-
-            # Jerk features
-            features.update(extract_jerk_features(acc_mag, "acc_mag"))
-
-        # Quaternion features（自動検出）
-        quat_cols = detect_quat_cols(sequence_df)
-        if quat_cols:
-            quaternions = sequence_df[quat_cols].values
-            quaternions = handle_quaternion_missing(quaternions)
-
-            # Quaternion statistics
-            for i, col in enumerate(quat_cols):
-                features.update(extract_statistical_features(quaternions[:, i], col))
-
-            # World acceleration
-            if all(f"acc_{axis}" in sequence_df.columns for axis in ["x", "y", "z"]):
-                acc_raw = sequence_df[["acc_x", "acc_y", "acc_z"]].values
-                world_acc = compute_world_acceleration(acc_raw, quaternions)
-
-                for i, axis in enumerate(["x", "y", "z"]):
-                    features.update(
-                        extract_statistical_features(
-                            world_acc[:, i], f"world_acc_{axis}"
-                        )
-                    )
-                    features.update(
-                        extract_frequency_features(world_acc[:, i], f"world_acc_{axis}")
-                    )
-
-                # World acceleration magnitude
-                world_acc_mag = np.linalg.norm(world_acc, axis=1)
-                features.update(
-                    extract_statistical_features(world_acc_mag, "world_acc_mag")
-                )
-                features.update(
-                    extract_hjorth_parameters(world_acc_mag, "world_acc_mag")
-                )
-                features.update(
-                    extract_frequency_features(world_acc_mag, "world_acc_mag")
-                )
-
-                # Linear acceleration
-                linear_acc = compute_linear_acceleration(acc_raw, quaternions)
-                for i, axis in enumerate(["x", "y", "z"]):
-                    features.update(
-                        extract_statistical_features(
-                            linear_acc[:, i], f"linear_acc_{axis}"
-                        )
-                    )
-
-                linear_acc_mag = np.linalg.norm(linear_acc, axis=1)
-                features.update(
-                    extract_statistical_features(linear_acc_mag, "linear_acc_mag")
-                )
-                features.update(
-                    extract_hjorth_parameters(linear_acc_mag, "linear_acc_mag")
-                )
-
-                # ⑦ Multi-resolution features (micro/short/medium windows)
-                if self.config.get("use_multi_resolution", False):
-                    for window_name, window_size in [
-                        ("micro", 5),
-                        ("short", 20),
-                        ("medium", 50),
-                    ]:
-                        if len(world_acc_mag) >= window_size:
-                            # Moving statistics
-                            rolling_mean = (
-                                pd.Series(world_acc_mag)
-                                .rolling(window_size, min_periods=1)
-                                .mean()
-                            )
-                            rolling_std = (
-                                pd.Series(world_acc_mag)
-                                .rolling(window_size, min_periods=1)
-                                .std()
-                            )
-
-                            features[f"world_acc_mag_{window_name}_mean_mean"] = (
-                                rolling_mean.mean()
-                            )
-                            features[f"world_acc_mag_{window_name}_mean_std"] = (
-                                rolling_mean.std()
-                            )
-                            features[f"world_acc_mag_{window_name}_std_mean"] = (
-                                rolling_std.mean()
-                            )
-                            features[f"world_acc_mag_{window_name}_std_max"] = (
-                                rolling_std.max()
-                            )
-
-                        if len(linear_acc_mag) >= window_size:
-                            rolling_mean = (
-                                pd.Series(linear_acc_mag)
-                                .rolling(window_size, min_periods=1)
-                                .mean()
-                            )
-                            features[f"linear_acc_mag_{window_name}_mean_std"] = (
-                                rolling_mean.std()
-                            )
-
-            # Angular velocity
-            angular_vel = compute_angular_velocity(quaternions)
-            for i, axis in enumerate(["x", "y", "z"]):
-                features.update(
-                    extract_statistical_features(
-                        angular_vel[:, i], f"angular_vel_{axis}"
-                    )
-                )
-            angular_vel_mag = np.linalg.norm(angular_vel, axis=1)
-            features.update(
-                extract_statistical_features(angular_vel_mag, "angular_vel_mag")
-            )
-
-            # Euler angles
-            euler_angles = quaternion_to_euler(quaternions)
-            for i, angle in enumerate(["roll", "pitch", "yaw"]):
-                features.update(
-                    extract_statistical_features(euler_angles[:, i], f"euler_{angle}")
-                )
-
-        # ② ToF features（PCAなし）
-        min_dists_all = []
-        sensor_ids = detect_tof_sensor_ids(sequence_df)
-        for sensor_id in sensor_ids:
-            tof_cols = [
-                c for c in sequence_df.columns if c.startswith(f"tof_{sensor_id}_")
-            ]
-            if tof_cols:
-                tof_data = sequence_df[tof_cols].values
-
-                # 利き手処理を適用
-                if self.config.get("tof_use_handedness_mirror", False):
-                    handedness = demographics_df["handedness"].iloc[0]
-                    for idx in range(len(tof_data)):
-                        tof_data[idx] = mirror_tof_by_handedness(
-                            tof_data[idx], handedness
-                        )
-
-                # NOTE: PCA変換はここではスキップ（fit()用なので）
-
-                # 各フレームの空間特徴量を処理
-                frame_features = []
-                for frame_idx in range(len(tof_data)):
-                    frame_8x8 = tof_data[frame_idx].reshape(8, 8)
-
-                    # Basic spatial features
-                    frame_feat = extract_tof_spatial_features(
-                        frame_8x8, f"tof_{sensor_id}_frame"
-                    )
-
-                    # 有効な場合は追加の空間特徴量を計算
-                    if self.config.get("tof_region_analysis", False):
-                        frame_feat.update(
-                            extract_tof_region_features(
-                                frame_8x8, f"tof_{sensor_id}_frame"
-                            )
-                        )
-                        frame_feat.update(
-                            extract_tof_near_frac(frame_8x8, f"tof_{sensor_id}_frame")
-                        )
-                        frame_feat.update(
-                            extract_tof_anisotropy(frame_8x8, f"tof_{sensor_id}_frame")
-                        )
-                        frame_feat.update(
-                            extract_tof_clustering_features(
-                                frame_8x8, f"tof_{sensor_id}_frame"
-                            )
-                        )
-
-                    frame_features.append(frame_feat)
-
-                # Aggregate over time
-                frame_df = pd.DataFrame(frame_features)
-                for col in frame_df.columns:
-                    time_series = frame_df[col].values
-                    # Time statistics
-                    features.update(extract_statistical_features(time_series, col))
-
-                    # Velocity (first difference)
-                    if len(time_series) > 1:
-                        velocity = np.diff(time_series)
-                        features.update(
-                            extract_statistical_features(velocity, f"{col}_velocity")
-                        )
-
-                # Min distance time series
-                min_dists = []
-                for frame_idx in range(len(tof_data)):
-                    frame_8x8 = tof_data[frame_idx].reshape(8, 8)
-                    valid_mask = (frame_8x8 >= 0) & ~np.isnan(frame_8x8)
-                    valid_data = frame_8x8[valid_mask]
-                    if len(valid_data) > 0:
-                        min_dists.append(np.min(valid_data))
-                    else:
-                        min_dists.append(np.nan)
-
-                min_dists = np.array(min_dists)
-                min_dists = min_dists[~np.isnan(min_dists)]
-
-                if len(min_dists) > 0:
-                    features.update(
-                        extract_statistical_features(
-                            min_dists, f"tof_{sensor_id}_min_dist"
-                        )
-                    )
-                    features.update(
-                        extract_hjorth_parameters(
-                            min_dists, f"tof_{sensor_id}_min_dist"
-                        )
-                    )
-                    features.update(
-                        extract_tof_arrival_event_features(
-                            min_dists, f"tof_{sensor_id}"
-                        )
-                    )
-                    min_dists_all.append(min_dists)
-
-                # Valid pixel ratio
-                valid_ratios = []
-                for frame_idx in range(len(tof_data)):
-                    frame_8x8 = tof_data[frame_idx].reshape(8, 8)
-                    valid_mask = (frame_8x8 >= 0) & ~np.isnan(frame_8x8)
-                    valid_ratios.append(np.mean(valid_mask))
-                valid_ratios = np.array(valid_ratios)
-                features.update(
-                    extract_statistical_features(
-                        valid_ratios, f"tof_{sensor_id}_valid_ratio"
-                    )
-                )
-
-        # ⑥ Cross-modal ToF sync features
-        if len(min_dists_all) > 1:
-            # センサーIDをキーとする辞書を作成
-            min_dists_dict = {
-                f"tof_{i}": min_dists_all[i] for i in range(len(min_dists_all))
-            }
-            sync_features = extract_tof_sensor_sync_features(min_dists_dict)
-            features.update(sync_features)
-
-        # Global min across all ToF sensors
-        if min_dists_all:
-            # Pad to same length
-            max_len = max(len(d) for d in min_dists_all)
-            padded_dists = []
-            for d in min_dists_all:
-                if len(d) < max_len:
-                    padded = np.pad(d, (0, max_len - len(d)), mode="edge")
-                else:
-                    padded = d
-                padded_dists.append(padded)
-
-            # Global min at each time point
-            global_min = np.min(np.vstack(padded_dists), axis=0)
-            features.update(
-                extract_statistical_features(global_min, "tof_min_dist_global")
-            )
-            features.update(
-                extract_hjorth_parameters(global_min, "tof_min_dist_global")
-            )
-
-        # ③ Thermal features
-        thermal_prefix = detect_thermal_prefix(sequence_df)
-        thermal_cols = [c for c in sequence_df.columns if c.startswith(thermal_prefix)]
-        for therm_col in thermal_cols:
-            therm_data = sequence_df[therm_col].values
-            therm_data = therm_data[~np.isnan(therm_data)]
-
-            if len(therm_data) > 0:
-                features.update(extract_statistical_features(therm_data, therm_col))
-
-                # Rate of change
-                if len(therm_data) > 1:
-                    therm_diff = np.diff(therm_data)
-                    features.update(
-                        extract_statistical_features(therm_diff, f"{therm_col}_diff")
-                    )
-
-                # Temperature trend
-                if len(therm_data) > 2:
-                    time_indices = np.arange(len(therm_data))
-                    slope, intercept = np.polyfit(time_indices, therm_data, 1)
-                    features[f"{therm_col}_trend_slope"] = slope
-                    features[f"{therm_col}_trend_intercept"] = intercept
-
-                # Second derivative (acceleration of temperature change)
-                if len(therm_data) > 2:
-                    therm_diff2 = np.diff(therm_data, n=2)
-                    features.update(
-                        extract_statistical_features(therm_diff2, f"{therm_col}_diff2")
-                    )
-
-        # ⑥ Cross-modal: IMU-ToF correlations
-        if "acc_mag" in locals() and len(acc_mag) > 0 and min_dists_all:
-            # Correlate acceleration peaks with ToF proximity
-            acc_peaks, _ = find_peaks(acc_mag, height=np.std(acc_mag) * 0.5)
-
-            for i, min_dists in enumerate(min_dists_all):
-                if len(min_dists) > 0:
-                    # Resample to match lengths
-                    if len(acc_mag) != len(min_dists):
-                        min_dists_resampled = np.interp(
-                            np.linspace(0, 1, len(acc_mag)),
-                            np.linspace(0, 1, len(min_dists)),
-                            min_dists,
-                        )
-                    else:
-                        min_dists_resampled = min_dists
-
-                    # Correlation
-                    if len(min_dists_resampled) > 1:
-                        correlation = np.corrcoef(acc_mag, min_dists_resampled)[0, 1]
-                        features[f"cross_acc_tof{i}_corr"] = correlation
-
-                    # Peak alignment
-                    if len(acc_peaks) > 0:
-                        # 加速度ピーク時のToF値をチェック
-                        peak_tof_values = []
-                        for peak_idx in acc_peaks:
-                            if peak_idx < len(min_dists_resampled):
-                                peak_tof_values.append(min_dists_resampled[peak_idx])
-                        if peak_tof_values:
-                            features[f"cross_acc_peak_tof{i}_mean"] = np.mean(
-                                peak_tof_values
-                            )
-                            features[f"cross_acc_peak_tof{i}_min"] = np.min(
-                                peak_tof_values
-                            )
-
-        # NaNまたはinf値を処理
-        for key in features:
-            if isinstance(features[key], (float, np.floating)):
-                if np.isnan(features[key]) or np.isinf(features[key]):
-                    features[key] = 0
-
-        return pd.DataFrame([features])
-
-    def _extract_features_raw(
-        self, sequence_df: pd.DataFrame, demographics_df: pd.DataFrame
-    ) -> pd.DataFrame:
-        """
-        シーケンスから生の特徴量を抽出する（スケーリングなし）。
-        これはpredict関数でfold毎のスケーラーを適用する前に使用される。
-        """
-        # extract_featuresと同じ処理を行うが、スケーリングはしない
-        return self.extract_features(sequence_df, demographics_df)
+        # extract_featuresメソッドをそのまま呼び出す
+        # （PCAはis_fittedでないため適用されない）
+        return self.extract_features(seq_df, demo_df)
 
     def extract_features(
         self, sequence_df: pd.DataFrame, demographics_df: pd.DataFrame
@@ -2450,6 +2317,11 @@ class FeatureExtractor:
                 # ⑤ Frequency features
                 features.update(extract_frequency_features(acc_data, f"acc_{axis}"))
 
+                # 🔧 T3: ロバスト正規化版IMU特徴量
+                acc_r = robust_normalize(acc_data)
+                features.update(extract_statistical_features(acc_r, f"accR_{axis}"))
+                features.update(extract_frequency_features(acc_r, f"accR_{axis}"))
+
         # Acceleration magnitude
         if all(f"acc_{axis}" in sequence_df.columns for axis in ["x", "y", "z"]):
             acc_mag = np.sqrt(
@@ -2582,13 +2454,20 @@ class FeatureExtractor:
                     extract_statistical_features(euler_angles[:, i], f"euler_{angle}")
                 )
 
+        # 🔧 T5: ToF品質チェック（低品質時は計算スキップ）
+        # 品質情報から計算する（既にextract_quality_featuresで計算済み）
+        q_tof_mean = features.get("quality_tof_all_valid_ratio_mean", 0.0)
+        HAS_TOF = q_tof_mean is not None and q_tof_mean >= self.config.get(
+            "quality_thresholds", {}
+        ).get("tof", 0.05)
+
         # ② ToF features
         min_dists_all = []
         for sensor_id in range(5):
             tof_cols = [
                 c for c in sequence_df.columns if c.startswith(f"tof_{sensor_id}_")
             ]
-            if tof_cols:
+            if tof_cols and HAS_TOF:  # T5: 品質が低い場合はスキップ
                 tof_data = sequence_df[tof_cols].values
 
                 # 利き手処理を適用
@@ -2631,7 +2510,7 @@ class FeatureExtractor:
                                         recon_error, f"tof_{sensor_id}_recon_error"
                                     )
                                 )
-                        except Exception:
+                        except:
                             pass  # 変換に失敗した場合はPCAをスキップ
 
                 # 各フレームの空間特徴量を処理
@@ -2786,11 +2665,19 @@ class FeatureExtractor:
                     )
 
         # ⑥ Cross-modal: IMU-ToF correlations
+        # 常に5つのセンサー分の特徴量を生成（存在しない場合は0）
+        for sensor_idx in range(5):
+            features[f"cross_acc_tof{sensor_idx}_corr"] = 0
+            features[f"cross_acc_peak_tof{sensor_idx}_mean"] = 0
+            features[f"cross_acc_peak_tof{sensor_idx}_min"] = 0
+
         if "acc_mag" in locals() and len(acc_mag) > 0 and min_dists_all:
             # Correlate acceleration peaks with ToF proximity
             acc_peaks, _ = find_peaks(acc_mag, height=np.std(acc_mag) * 0.5)
 
             for i, min_dists in enumerate(min_dists_all):
+                if i >= 5:  # 最大5センサーまで
+                    break
                 if len(min_dists) > 0:
                     # Resample to match lengths
                     if len(acc_mag) != len(min_dists):
@@ -2805,7 +2692,8 @@ class FeatureExtractor:
                     # Correlation
                     if len(min_dists_resampled) > 1:
                         correlation = np.corrcoef(acc_mag, min_dists_resampled)[0, 1]
-                        features[f"cross_acc_tof{i}_corr"] = correlation
+                        if not np.isnan(correlation):
+                            features[f"cross_acc_tof{i}_corr"] = correlation
 
                     # Peak alignment
                     if len(acc_peaks) > 0:
@@ -2822,15 +2710,68 @@ class FeatureExtractor:
                                 peak_tof_values
                             )
 
-        # NaNまたはinf値を処理
-        for key in features:
-            if isinstance(features[key], (float, np.floating)):
-                if np.isnan(features[key]) or np.isinf(features[key]):
-                    features[key] = 0
+        # 🔧 T1: NaN/inf値の処理（preserve_nan_for_missingに応じて）
+        if not self.config.get("preserve_nan_for_missing", False):
+            # 従来の処理: NaN/infを0に置換
+            for key in features:
+                if isinstance(features[key], (float, np.floating)):
+                    if np.isnan(features[key]) or np.isinf(features[key]):
+                        features[key] = 0
+        # else: NaNを保持（XGBoostが処理）
 
         return pd.DataFrame([features])
 
     # transform()メソッドは既に上で定義済み
+
+
+# ====================================================================================================
+# MODALITY DROPOUT (T7)
+# ====================================================================================================
+
+
+def apply_modality_dropout(X: pd.DataFrame, p: float, seed: int = 42) -> pd.DataFrame:
+    """
+    🔧 T7: モダリティ・ドロップアウト
+    学習時にToF/サーマル特徴をランダムにNaN化して、
+    IMU-onlyデータへの順応性を高める。
+
+    Args:
+        X: 特徴量DataFrame
+        p: ドロップアウト確率（0-1）
+        seed: 乱数シード
+
+    Returns:
+        ドロップアウトを適用したDataFrame
+    """
+    if p <= 0:
+        return X
+
+    X_dropout = X.copy()
+    rng = np.random.RandomState(seed)
+    n_samples = len(X)
+
+    # ドロップアウトする行をランダムに選択
+    dropout_mask = rng.rand(n_samples) < p
+
+    # ToFとサーマル関連の列を見つける
+    drop_cols = []
+    for col in X.columns:
+        if (
+            col.startswith("tof_")
+            or col.startswith("thm_")
+            or col.startswith("therm_")
+            or col.startswith("thermal_")
+        ):
+            drop_cols.append(col)
+
+    # 選択された行の該当列をNaN化
+    if len(drop_cols) > 0:
+        X_dropout.loc[dropout_mask, drop_cols] = np.nan
+        print(
+            f"  Applied modality dropout: {dropout_mask.sum()}/{n_samples} samples, {len(drop_cols)} columns"
+        )
+
+    return X_dropout
 
 
 # ====================================================================================================
@@ -2927,120 +2868,49 @@ class FeatureExporter:
 
 
 # ====================================================================================================
-# CHECKPOINT UTILITIES
+# DATA VARIANT BUILDING (T6)
 # ====================================================================================================
 
 
-def save_checkpoint(
-    checkpoint_dir: Path,
-    fold: int,
-    models: list,
-    extractor,
-    cv_scores: list,
-    binary_f1_scores: list,
-    macro_f1_scores: list,
-    oof_predictions: np.ndarray,
-    train_state: dict = None,
-) -> Path:
+def build_dataset_variant(
+    features_df: pd.DataFrame, variant: str = "full"
+) -> pd.DataFrame:
     """
-    学習途中のチェックポイントを保存する。
+    🔧 T6: データバリアントの恒常化
+    Full版とIMU-only版のデータセットを生成。
 
     Args:
-        checkpoint_dir: チェックポイント保存ディレクトリ
-        fold: 現在のfold番号
-        models: これまでに学習したモデルのリスト
-        extractor: 特徴量抽出器
-        cv_scores: CV scoreのリスト
-        binary_f1_scores: Binary F1 scoreのリスト
-        macro_f1_scores: Macro F1 scoreのリスト
-        oof_predictions: Out-of-fold predictions
-        train_state: その他の学習状態（オプション）
+        features_df: 特徴量DataFrame
+        variant: "full" または "imu_only"
 
     Returns:
-        保存したチェックポイントのパス
+        指定されたバリアントのDataFrame
     """
-    checkpoint_dir = Path(checkpoint_dir)
-    checkpoint_dir.mkdir(exist_ok=True, parents=True)
+    if variant == "full":
+        # Full版はそのまま返す
+        return features_df
+    elif variant == "imu_only":
+        # IMU-only版：ToF/サーマル特徴をNaN化
+        features_variant = features_df.copy()
 
-    # チェックポイントファイル名
-    checkpoint_file = checkpoint_dir / f"checkpoint_fold{fold}.pkl"
+        # ToFとサーマル関連の列を見つけてNaN化
+        drop_cols = []
+        for col in features_variant.columns:
+            if (
+                col.startswith("tof_")
+                or col.startswith("thm_")
+                or col.startswith("therm_")
+                or col.startswith("thermal_")
+            ):
+                drop_cols.append(col)
 
-    # チェックポイントデータ
-    checkpoint_data = {
-        "fold": fold,
-        "models": models,
-        "extractor": extractor,
-        "cv_scores": cv_scores,
-        "binary_f1_scores": binary_f1_scores,
-        "macro_f1_scores": macro_f1_scores,
-        "oof_predictions": oof_predictions,
-        "train_state": train_state or {},
-        "timestamp": datetime.now().isoformat(),
-    }
+        if len(drop_cols) > 0:
+            features_variant[drop_cols] = np.nan
+            print(f"  Created IMU-only variant: {len(drop_cols)} columns set to NaN")
 
-    # 保存
-    with open(checkpoint_file, "wb") as f:
-        pickle.dump(checkpoint_data, f)
-
-    print(f"💾 Checkpoint saved: {checkpoint_file}")
-    return checkpoint_file
-
-
-def load_checkpoint(checkpoint_dir: Path) -> tuple:
-    """
-    最新のチェックポイントをロードする。
-
-    Args:
-        checkpoint_dir: チェックポイント保存ディレクトリ
-
-    Returns:
-        (checkpoint_data, checkpoint_file) のタプル
-        チェックポイントが見つからない場合は (None, None)
-    """
-    checkpoint_dir = Path(checkpoint_dir)
-
-    if not checkpoint_dir.exists():
-        return None, None
-
-    # 最新のチェックポイントを探す
-    checkpoint_files = sorted(checkpoint_dir.glob("checkpoint_fold*.pkl"))
-
-    if not checkpoint_files:
-        return None, None
-
-    # 最新のチェックポイントをロード
-    latest_checkpoint = checkpoint_files[-1]
-    print(f"📥 Loading checkpoint: {latest_checkpoint}")
-
-    with open(latest_checkpoint, "rb") as f:
-        checkpoint_data = pickle.load(f)
-
-    # チェックポイント情報を表示
-    fold = checkpoint_data.get("fold", -1)
-    n_models = len(checkpoint_data.get("models", []))
-    timestamp = checkpoint_data.get("timestamp", "unknown")
-
-    print(f"  ✓ Checkpoint from fold {fold + 1}")
-    print(f"  ✓ {n_models} models loaded")
-    print(f"  ✓ Saved at: {timestamp}")
-
-    return checkpoint_data, latest_checkpoint
-
-
-def remove_checkpoints(checkpoint_dir: Path):
-    """
-    チェックポイントディレクトリを削除する。
-
-    Args:
-        checkpoint_dir: チェックポイント保存ディレクトリ
-    """
-    checkpoint_dir = Path(checkpoint_dir)
-
-    if checkpoint_dir.exists():
-        import shutil
-
-        shutil.rmtree(checkpoint_dir)
-        print(f"🗑️  Removed checkpoint directory: {checkpoint_dir}")
+        return features_variant
+    else:
+        raise ValueError(f"Unknown variant: {variant}")
 
 
 # ====================================================================================================
@@ -3052,94 +2922,30 @@ def train_models():
     """Train XGBoost models with cross-validation, with feature import/export.
 
     改修：CVリーク防止のため、fold内でScaler/PCAをfit。
-    学習済モデルのロード機能を追加。
-    チェックポイント機能を追加。
+    チェックポイント、学習済みモデル、fold_artifacts対応を追加。
     """
     # Access global variables
     global USE_EXPORTED_FEATURES, EXPORTED_FEATURES_PATH, EXPORT_FEATURES, EXPORT_NAME
-    global \
-        USE_PRETRAINED_MODEL, \
-        PRETRAINED_MODEL_PATH, \
-        PRETRAINED_EXTRACTOR_PATH, \
-        EXPORT_TRAINED_MODEL
-    global USE_CHECKPOINT, CHECKPOINT_DIR, CHECKPOINT_INTERVAL, AUTO_REMOVE_CHECKPOINT
+    global MODELS, EXTRACTOR, FOLD_ARTIFACTS
+    global USE_PRETRAINED_MODEL, PRETRAINED_MODEL_PATH, PRETRAINED_EXTRACTOR_PATH
+    global EXPORT_TRAINED_MODEL, USE_CHECKPOINT
 
     print("\n" + "=" * 70)
     print("TRAINING PHASE")
     print("=" * 70)
 
-    # 学習済モデルを使用する場合
+    # 学習済みモデルを使用する場合
     if USE_PRETRAINED_MODEL:
-        print("\n📥 Mode: LOAD PRETRAINED MODEL")
-
-        # パスの自動検出
-        model_path = PRETRAINED_MODEL_PATH
-        extractor_path = PRETRAINED_EXTRACTOR_PATH
-
-        if model_path is None or extractor_path is None:
-            # デフォルトパスを探す
-            if IS_KAGGLE_ENV:
-                # Kaggle環境では/kaggle/input/から読み込む
-                model_path = model_path or "/kaggle/input/cmi-models/models.pkl"
-                extractor_path = (
-                    extractor_path or "/kaggle/input/cmi-models/extractor.pkl"
-                )
-            else:
-                # ローカル環境ではexported_featuresから最新のものを探す
-                exports = sorted(EXPORT_DIR.glob("features_*"))
-                if exports:
-                    latest_export = exports[-1]
-                    model_path = model_path or str(latest_export / "models_5fold.pkl")
-                    extractor_path = extractor_path or str(
-                        latest_export / "extractor.pkl"
-                    )
-                else:
-                    print("⚠️ No saved models found. Switching to training mode...")
-                    USE_PRETRAINED_MODEL = False
-
-        if USE_PRETRAINED_MODEL and model_path and Path(model_path).exists():
-            print(f"   Model path: {model_path}")
-            print(f"   Extractor path: {extractor_path}")
-
-            # モデルをロード
-            with open(model_path, "rb") as f:
-                models = pickle.load(f)
-            print(f"✓ Loaded {len(models)} models")
-
-            # Extractorをロード
-            if Path(extractor_path).exists():
-                with open(extractor_path, "rb") as f:
-                    extractor = pickle.load(f)
-                print("✓ Loaded feature extractor")
-            else:
-                print("⚠️ Extractor not found, creating new one...")
-                extractor = FeatureExtractor(CONFIG)
-
-            # fold_artifactsも作成（学習済モデルを使用する場合は空リスト）
-            fold_artifacts = []
-
-            # ダミーのメトリクスを返す（学習していないため）
-            metrics = {
-                "mean_score": 0.0,
-                "std_score": 0.0,
-                "mean_binary_f1": 0.0,
-                "std_binary_f1": 0.0,
-                "mean_macro_f1": 0.0,
-                "std_macro_f1": 0.0,
-                "cv_scores": [],
-                "binary_f1_scores": [],
-                "macro_f1_scores": [],
-            }
-
-            print("\n✓ Pretrained models loaded successfully!")
-            print("   Skipping training phase.")
-            return models, extractor, metrics, fold_artifacts
+        print("\n📦 Loading pretrained model...")
+        if PRETRAINED_MODEL_PATH and Path(PRETRAINED_MODEL_PATH).exists():
+            MODELS, EXTRACTOR = load_models(
+                PRETRAINED_MODEL_PATH, PRETRAINED_EXTRACTOR_PATH
+            )
+            print("✓ Pretrained model loaded")
+            return MODELS, EXTRACTOR, {}
         else:
-            print(f"⚠️ Model file not found: {model_path}")
-            print("   Switching to training mode...")
+            print("⚠️ Pretrained model not found, proceeding with training...")
             USE_PRETRAINED_MODEL = False
-
-    # 通常の学習処理
 
     # Display current settings
     if USE_EXPORTED_FEATURES:
@@ -3323,49 +3129,20 @@ def train_models():
         n_splits=CONFIG["n_folds"], shuffle=True, random_state=CONFIG["random_state"]
     )
 
-    # チェックポイントからの再開
-    checkpoint_data = None
-    start_fold = 0
-
-    if USE_CHECKPOINT:
-        checkpoint_dir = Path(CHECKPOINT_DIR)
-        checkpoint_data, checkpoint_file = load_checkpoint(checkpoint_dir)
-
-        if checkpoint_data is not None:
-            print("\n📥 Resuming from checkpoint...")
-            models = checkpoint_data.get("models", [])
-            oof_predictions = checkpoint_data.get(
-                "oof_predictions", np.zeros(len(labels))
-            )
-            cv_scores = checkpoint_data.get("cv_scores", [])
-            binary_f1_scores = checkpoint_data.get("binary_f1_scores", [])
-            macro_f1_scores = checkpoint_data.get("macro_f1_scores", [])
-            start_fold = checkpoint_data.get("fold", -1) + 1
-
-            # Extractorも復元
-            if "extractor" in checkpoint_data:
-                temp_extractor = checkpoint_data["extractor"]
-
-            print(f"  ✓ Resuming from fold {start_fold + 1}")
-        else:
-            print("  ⚠️ No checkpoint found, starting from scratch...")
-            models = []
-            oof_predictions = np.zeros(len(labels))
-            cv_scores = []
-            binary_f1_scores = []
-            macro_f1_scores = []
-    else:
+    # チェックポイントから再開
+    models, fold_artifacts, start_fold = load_checkpoint()
+    if models is None:
         models = []
-        oof_predictions = np.zeros(len(labels))
-        cv_scores = []
-        binary_f1_scores = []
-        macro_f1_scores = []
+        fold_artifacts = []
+        start_fold = 0
+
+    oof_predictions = np.zeros(len(labels))
+    cv_scores = []
+    binary_f1_scores = []
+    macro_f1_scores = []
 
     # Store extractor from first fold for later use
     final_extractor = None
-
-    # fold毎のスケーラーとメタデータを保存するリスト
-    fold_artifacts = []
 
     # Keep the extractor for later use
     # temp_extractorがNoneの場合は新しく作成
@@ -3375,12 +3152,10 @@ def train_models():
 
     # Cross-validation loop
     for fold, (train_idx, val_idx) in enumerate(cv.split(labels, labels, subjects)):
-        # チェックポイントから再開する場合、完了済みのfoldはスキップ
+        # 既に処理済みのfoldはスキップ
         if fold < start_fold:
-            print(
-                f"--- Fold {fold + 1}/{CONFIG['n_folds']} --- (Skipped - already completed)"
-            )
             continue
+
         print(f"--- Fold {fold + 1}/{CONFIG['n_folds']} ---")
 
         # このfoldのデータを分割（事前に抽出した特徴量を使用）
@@ -3419,11 +3194,6 @@ def train_models():
                 extractor.feature_names = list(X_train.columns)
             if hasattr(extractor, "is_fitted"):
                 extractor.is_fitted = True
-
-            # fold固有のscalerを保存
-            fold_artifacts.append(
-                {"feature_names": list(X_train_raw.columns), "scaler": scaler}
-            )
         else:
             # 新規に抽出した特徴量を使用
             print("  Using newly extracted features, fitting scaler for this fold...")
@@ -3445,11 +3215,6 @@ def train_models():
                 scaler.transform(X_val_raw),
                 columns=X_val_raw.columns,
                 index=X_val_raw.index,
-            )
-
-            # fold固有のscalerを保存
-            fold_artifacts.append(
-                {"feature_names": list(X_train_raw.columns), "scaler": scaler}
             )
 
         # Store first fold's extractor for later use
@@ -3481,35 +3246,26 @@ def train_models():
         # Configure XGBoost parameters based on environment
         xgb_params = CONFIG["xgb_params"].copy()
 
-        # GPU acceleration settings - auto-detect environment
-        if IS_KAGGLE_ENV:
-            # Kaggle環境でGPUチェック
-            try:
-                import torch
+        # GPU acceleration settings - 自動検出
+        try:
+            import torch
 
-                if torch.cuda.is_available():
-                    xgb_params["tree_method"] = "gpu_hist"
-                    xgb_params["device"] = "cuda:0"
-                    xgb_params.pop("gpu_id", None)
-                    print("  Using GPU acceleration (CUDA/T4)")
-                else:
-                    # CPU環境
-                    xgb_params["tree_method"] = "hist"
-                    xgb_params["device"] = "cpu"
-                    xgb_params.pop("gpu_id", None)
-                    print("  Using CPU (GPU not available)")
-            except ImportError:
-                # torchがインストールされていない場合はCPU使用
+            if torch.cuda.is_available():
+                xgb_params["tree_method"] = "gpu_hist"
+                xgb_params["device"] = "cuda:0"
+                xgb_params.pop("gpu_id", None)
+                print("  Using GPU acceleration (CUDA)")
+            else:
                 xgb_params["tree_method"] = "hist"
                 xgb_params["device"] = "cpu"
                 xgb_params.pop("gpu_id", None)
-                print("  Using CPU (torch not available for GPU check)")
-        else:
-            # Local Mac - MPS is not yet supported by XGBoost, use CPU
+                print("  Using CPU")
+        except ImportError:
+            # torchがインストールされていない場合はCPUを使用
             xgb_params["tree_method"] = "hist"
             xgb_params["device"] = "cpu"
             xgb_params.pop("gpu_id", None)
-            print("  Using CPU (MPS not supported by XGBoost)")
+            print("  Using CPU (torch not installed)")
 
         # XGBoostを訓練
         model = xgb.XGBClassifier(**xgb_params)
@@ -3522,6 +3278,17 @@ def train_models():
         )
 
         models.append(model)
+
+        # fold artifactsを保存
+        fold_artifacts.append(
+            {"feature_names": list(X_train_raw.columns), "scaler": scaler}
+        )
+
+        # チェックポイントを保存
+        if USE_CHECKPOINT and (fold + 1) % CHECKPOINT_INTERVAL == 0:
+            save_checkpoint(
+                fold, model, list(X_train_raw.columns), scaler, fold_artifacts
+            )
 
         # Predictions
         val_preds = model.predict(X_val)
@@ -3550,24 +3317,14 @@ def train_models():
             f"Fold {fold + 1} - Binary F1: {binary_f1:.4f}, Macro F1: {macro_f1:.4f}, Score: {score:.4f}"
         )
 
-        # チェックポイントを保存
-        if USE_CHECKPOINT and (fold + 1) % CHECKPOINT_INTERVAL == 0:
-            checkpoint_dir = Path(CHECKPOINT_DIR)
-            save_checkpoint(
-                checkpoint_dir=checkpoint_dir,
-                fold=fold,
-                models=models,
-                extractor=extractor,
-                cv_scores=cv_scores,
-                binary_f1_scores=binary_f1_scores,
-                macro_f1_scores=macro_f1_scores,
-                oof_predictions=oof_predictions,
-                train_state={
-                    "labels": labels.tolist(),
-                    "subjects": subjects.tolist(),
-                    "X_all_shape": X_all.shape if X_all is not None else None,
-                },
-            )
+    # チェックポイントを削除
+    if USE_CHECKPOINT:
+        remove_checkpoints()
+
+    # グローバル変数に保存
+    MODELS = models
+    EXTRACTOR = final_extractor if final_extractor else extractor
+    FOLD_ARTIFACTS = fold_artifacts
 
     print("" + "=" * 70)
     print("CROSS-VALIDATION RESULTS")
@@ -3598,72 +3355,9 @@ def train_models():
         print("\nTop 20 Most Important Features:")
         print(feature_importance.head(20))
 
-    # 特徴量がエクスポートされた場合、モデルとエクストラクタを保存
-    if EXPORT_NAME and EXPORT_FEATURES:
-        export_path = EXPORT_DIR / EXPORT_NAME
-        if export_path.exists():
-            # モデルを保存
-            model_file = export_path / f"models_{CONFIG['n_folds']}fold.pkl"
-            with open(model_file, "wb") as f:
-                pickle.dump(models, f)
-            print(f"✓ Models saved to: {model_file}")
-
-            # Extractorも保存（推論時に必要）
-            extractor_file = export_path / "extractor.pkl"
-            with open(extractor_file, "wb") as f:
-                pickle.dump(final_extractor, f)
-            print(f"✓ Extractor saved to: {extractor_file}")
-
-    # 学習済モデルをエクスポートする（EXPORT_TRAINED_MODELがTrueの場合）
-    if EXPORT_TRAINED_MODEL and not USE_PRETRAINED_MODEL:
-        print("\n💾 Exporting trained models...")
-
-        # タイムスタンプを生成
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        model_export_dir = EXPORT_DIR / f"models_{timestamp}"
-        model_export_dir.mkdir(exist_ok=True, parents=True)
-
-        # モデルを保存
-        model_file = model_export_dir / "models.pkl"
-        with open(model_file, "wb") as f:
-            pickle.dump(models, f)
-        print(f"✓ Models saved to: {model_file}")
-
-        # Extractorを保存
-        extractor_file = model_export_dir / "extractor.pkl"
-        with open(extractor_file, "wb") as f:
-            pickle.dump(final_extractor, f)
-        print(f"✓ Extractor saved to: {extractor_file}")
-
-        # fold artifactsを保存
-        artifacts_file = model_export_dir / "fold_artifacts.pkl"
-        with open(artifacts_file, "wb") as f:
-            pickle.dump(fold_artifacts, f)
-        print(f"✓ Fold artifacts saved to: {artifacts_file}")
-
-        # メトリクスも保存
-        metrics_file = model_export_dir / "metrics.json"
-        metrics_dict = {
-            "mean_score": mean_score,
-            "std_score": std_score,
-            "mean_binary_f1": mean_binary_f1,
-            "std_binary_f1": std_binary_f1,
-            "mean_macro_f1": mean_macro_f1,
-            "std_macro_f1": std_macro_f1,
-            "cv_scores": cv_scores,
-            "binary_f1_scores": binary_f1_scores,
-            "macro_f1_scores": macro_f1_scores,
-            "timestamp": timestamp,
-            "n_folds": CONFIG["n_folds"],
-        }
-        with open(metrics_file, "w") as f:
-            json.dump(metrics_dict, f, indent=2)
-        print(f"✓ Metrics saved to: {metrics_file}")
-
-        print("\n📝 To use these models in the future, set:")
-        print("   USE_PRETRAINED_MODEL = True")
-        print(f'   PRETRAINED_MODEL_PATH = "{model_file}"')
-        print(f'   PRETRAINED_EXTRACTOR_PATH = "{extractor_file}"')
+    # 学習済みモデルをエクスポート
+    if EXPORT_TRAINED_MODEL:
+        save_models(models, final_extractor, fold_artifacts)
 
     # 結果をまとめて返す
     metrics = {
@@ -3678,15 +3372,46 @@ def train_models():
         "macro_f1_scores": macro_f1_scores,
     }
 
-    # 学習完了時にチェックポイントを自動削除
-    if USE_CHECKPOINT and AUTO_REMOVE_CHECKPOINT:
-        checkpoint_dir = Path(CHECKPOINT_DIR)
-        if checkpoint_dir.exists():
-            remove_checkpoints(checkpoint_dir)
-            print("✓ Training completed successfully, checkpoints removed")
+    return models, final_extractor, metrics
 
-    # fold_artifactsも一緒に返す（save時に使用）
-    return models, final_extractor, metrics, fold_artifacts
+
+# ========================================
+# モデルの保存と読み込み
+# ========================================
+
+
+def save_models(models, extractor, fold_artifacts):
+    """学習済みモデルとエクストラクタを保存"""
+    import pickle
+    from pathlib import Path
+
+    # エクスポートディレクトリを作成
+    model_export_dir = Path("trained_models")
+    model_export_dir.mkdir(exist_ok=True)
+
+    # モデルを保存
+    model_file = model_export_dir / "models.pkl"
+    with open(model_file, "wb") as f:
+        pickle.dump(models, f)
+    print(f"✓ Models saved to: {model_file}")
+
+    # エクストラクタを保存
+    extractor_file = model_export_dir / "extractor.pkl"
+    with open(extractor_file, "wb") as f:
+        pickle.dump(extractor, f)
+    print(f"✓ Extractor saved to: {extractor_file}")
+
+    # fold artifactsを保存
+    artifacts_file = model_export_dir / "fold_artifacts.pkl"
+    with open(artifacts_file, "wb") as f:
+        pickle.dump(fold_artifacts, f)
+    print(f"✓ Fold artifacts saved to: {artifacts_file}")
+
+    print(f"\n📦 All models exported to: {model_export_dir}/")
+    print("To use these models for inference, set:")
+    print("  USE_PRETRAINED_MODEL = True")
+    print(f'  PRETRAINED_MODEL_PATH = "{model_file}"')
+    print(f'  PRETRAINED_EXTRACTOR_PATH = "{extractor_file}"')
 
 
 # ====================================================================================================
@@ -3696,35 +3421,6 @@ def train_models():
 # Global variables for models
 MODELS = None
 EXTRACTOR = None
-FOLD_ARTIFACTS = None  # fold毎のスケーラーとメタデータ
-
-
-def save_models(
-    models,
-    extractor,
-    fold_artifacts=None,
-    model_path: str = "models.pkl",
-    extractor_path: str = "extractor.pkl",
-    artifacts_path: str = "fold_artifacts.pkl",
-):
-    """
-    モデルとExtractorを保存する。
-    """
-    print(f"Saving models to: {model_path}")
-    with open(model_path, "wb") as f:
-        pickle.dump(models, f)
-
-    print(f"Saving extractor to: {extractor_path}")
-    with open(extractor_path, "wb") as f:
-        pickle.dump(extractor, f)
-
-    # fold artifactsが提供されている場合は保存
-    if fold_artifacts is not None:
-        print(f"Saving fold artifacts to: {artifacts_path}")
-        with open(artifacts_path, "wb") as f:
-            pickle.dump(fold_artifacts, f)
-
-    print("✓ Models and extractor saved successfully")
 
 
 def load_models(
@@ -3736,6 +3432,7 @@ def load_models(
     """
     global MODELS, EXTRACTOR, FOLD_ARTIFACTS
     global PRETRAINED_MODEL_PATH, PRETRAINED_EXTRACTOR_PATH, PRETRAINED_ARTIFACTS_PATH
+    import os
 
     # グローバル変数が設定されている場合はそれを使用
     if model_path is None and PRETRAINED_MODEL_PATH is not None:
@@ -3753,25 +3450,29 @@ def load_models(
     if artifacts_path is None and os.path.exists("fold_artifacts.pkl"):
         artifacts_path = "fold_artifacts.pkl"
 
-    # それでも無ければデフォルトパスを探す
+    # trained_modelsディレクトリもチェック
+    if model_path is None and os.path.exists("trained_models/models.pkl"):
+        model_path = "trained_models/models.pkl"
+    if extractor_path is None and os.path.exists("trained_models/extractor.pkl"):
+        extractor_path = "trained_models/extractor.pkl"
+    if artifacts_path is None and os.path.exists("trained_models/fold_artifacts.pkl"):
+        artifacts_path = "trained_models/fold_artifacts.pkl"
+
+    # それでもなければデフォルトパスを探す
     if model_path is None:
         if IS_KAGGLE_ENV:
             # Kaggle環境では/kaggle/input/から読み込む
             model_path = "/kaggle/input/cmi-models/models.pkl"
-            if extractor_path is None:
-                extractor_path = "/kaggle/input/cmi-models/extractor.pkl"
-            if artifacts_path is None:
-                artifacts_path = "/kaggle/input/cmi-models/fold_artifacts.pkl"
+            extractor_path = "/kaggle/input/cmi-models/extractor.pkl"
+            artifacts_path = "/kaggle/input/cmi-models/fold_artifacts.pkl"
         else:
             # ローカル環境ではexported_featuresから最新のものを探す
-            exports = sorted(EXPORT_DIR.glob("models_*"))
+            exports = sorted(EXPORT_DIR.glob("features_*"))
             if exports:
                 latest_export = exports[-1]
-                model_path = latest_export / "models.pkl"
-                if extractor_path is None:
-                    extractor_path = latest_export / "extractor.pkl"
-                if artifacts_path is None:
-                    artifacts_path = latest_export / "fold_artifacts.pkl"
+                model_path = latest_export / "models_5fold.pkl"
+                extractor_path = latest_export / "extractor.pkl"
+                artifacts_path = latest_export / "fold_artifacts.pkl"
             else:
                 raise FileNotFoundError(
                     "No saved models found. Please train models first."
@@ -3795,7 +3496,7 @@ def load_models(
 
     # fold artifactsのロード
     FOLD_ARTIFACTS = None
-    if artifacts_path and os.path.exists(artifacts_path):
+    if artifacts_path and Path(artifacts_path).exists():
         with open(artifacts_path, "rb") as f:
             FOLD_ARTIFACTS = pickle.load(f)
         print(f"✓ Loaded fold artifacts: {len(FOLD_ARTIFACTS)} folds")
@@ -3806,75 +3507,88 @@ def load_models(
     return MODELS, EXTRACTOR
 
 
-def _to01_handedness(v):
-    """handednessを0/1に変換する共通関数"""
-    if isinstance(v, str):
-        v = v.strip().lower()
-        if v.startswith("r"):
-            return 1
-        if v.startswith("l"):
-            return 0
-    try:
-        return int(v)
-    except (ValueError, TypeError):
-        return 0
-
-
 def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     """
     Prediction function for Kaggle inference server.
-    改修：fold毎のスケーラーを使用して予測を行う。
+    改修：fold毎のスケーラーを使用して正しくスケーリング。
     """
     global MODELS, EXTRACTOR, FOLD_ARTIFACTS
 
     # 必要に応じてモデルを初期化（ロードのみ）
     if MODELS is None or EXTRACTOR is None:
-        print("[PREDICT] Models not initialized, loading pre-trained models...")
+        print("Loading pre-trained models...")
         try:
             MODELS, EXTRACTOR = load_models()
-            print("[PREDICT] ✓ Models loaded successfully")
         except FileNotFoundError as e:
-            print(f"[PREDICT] Warning: {e}")
-            print("[PREDICT] Attempting to train models (may timeout)...")
-            try:
-                MODELS, EXTRACTOR, _ = train_models()
-                print("[PREDICT] ✓ Models trained")
-            except Exception as train_error:
-                print(f"[PREDICT] Training failed: {train_error}")
-                # デフォルト予測を返すために例外は発生させない
-                return "Wave hello"
+            print(f"Error: {e}")
+            print(
+                "Falling back to training models (this may timeout on evaluation server)..."
+            )
+            MODELS, EXTRACTOR, _ = train_models()
 
     # pandasに変換
     seq_df = sequence.to_pandas()
-    demo_df = demographics.to_pandas().copy()
+    demo_df = demographics.to_pandas()
 
-    # handednessの正規化
+    # handednessの変換（R/L文字列を1/0に）
     if "handedness" in demo_df.columns:
-        demo_df["handedness"] = demo_df["handedness"].map(_to01_handedness)
+        demo_df = demo_df.copy()
+        demo_df["handedness"] = demo_df["handedness"].apply(_to01_handedness)
 
-    # 生の特徴量を抽出（スケーリングなし）
-    X_raw = EXTRACTOR._extract_features_raw(seq_df, demo_df)
-
-    predictions = []
-    if FOLD_ARTIFACTS is None:
-        # 互換性確保：fold artifactsがない場合は従来の方法を使用（非推奨）
-        print("[PREDICT] Warning: Using single scaler for all folds (not recommended)")
-        features = EXTRACTOR.transform([seq_df], [demo_df])
-        for model in MODELS:
-            predictions.append(model.predict_proba(features)[0])
+    # 生の特徴量を抽出（スケーリング前）
+    if hasattr(EXTRACTOR, "_extract_features_raw"):
+        X_raw = EXTRACTOR._extract_features_raw(seq_df, demo_df)
     else:
-        # fold毎のスケーラーを使用して予測
+        # 後方互換性のため
+        features = EXTRACTOR.extract_features(seq_df, demo_df)
+        X_raw = features
+
+    # すべてのモデルから予測を取得
+    predictions = []
+
+    if FOLD_ARTIFACTS is not None and len(FOLD_ARTIFACTS) == len(MODELS):
+        # fold毎のスケーラーを使用（正しい方法）
         for model, art in zip(MODELS, FOLD_ARTIFACTS):
-            X = X_raw.copy()
-            # 列合わせ
-            for col in art["feature_names"]:
-                if col not in X.columns:
-                    X[col] = 0
-            X = X[art["feature_names"]]
-            # fold専用スケーラで変換
-            Xs = art["scaler"].transform(X)
+            # 訓練時の特徴量名に合わせる
+            feature_names = art["feature_names"]
+
+            # X_rawから必要な特徴量のみを選択（存在しない特徴量は0で埋める）
+            X_selected = pd.DataFrame()
+            for col in feature_names:
+                if col in X_raw.columns:
+                    X_selected[col] = X_raw[col]
+                else:
+                    # 訓練時にあったが推論時にない特徴量は0で埋める
+                    X_selected[col] = 0
+
+            # このfoldのスケーラーを適用
+            X_scaled = pd.DataFrame(
+                art["scaler"].transform(X_selected),
+                columns=feature_names,
+                index=X_raw.index,
+            )
+
             # 予測
-            predictions.append(model.predict_proba(Xs)[0])
+            pred = model.predict_proba(X_scaled)[0]
+            predictions.append(pred)
+    else:
+        # fold artifactsがない場合は従来の方法（非推奨）
+        print("⚠️ Warning: Using fallback prediction without fold-specific scalers")
+
+        # extractorのスケーラーを使用（fold 0のみ）
+        if hasattr(EXTRACTOR, "scaler") and EXTRACTOR.scaler is not None:
+            X_scaled = pd.DataFrame(
+                EXTRACTOR.scaler.transform(X_raw),
+                columns=X_raw.columns,
+                index=X_raw.index,
+            )
+        else:
+            # スケーラーがない場合はそのまま使用
+            X_scaled = X_raw
+
+        for model in MODELS:
+            pred = model.predict_proba(X_scaled)[0]
+            predictions.append(pred)
 
     # Average predictions
     avg_pred = np.mean(predictions, axis=0)
@@ -3939,7 +3653,7 @@ if __name__ == "__main__":
             print("No exported features found. First run will extract and export.")
 
     # モデルを訓練
-    MODELS, EXTRACTOR, metrics, fold_artifacts = train_models()
+    MODELS, EXTRACTOR, metrics = train_models()
     print("✓ Models trained successfully")
     print(
         f"   Binary F1: {metrics['mean_binary_f1']:.4f} ± {metrics['std_binary_f1']:.4f}"
@@ -3974,30 +3688,20 @@ if __name__ == "__main__":
 
     # Kaggle推論サーバーを初期化
     if IS_KAGGLE_ENV:
-        print("\n" + "=" * 70)
-        print("INITIALIZING KAGGLE INFERENCE SERVER")
-        print("=" * 70)
-
-        # モデルを保存（推論サーバーで使用）
-        if MODELS is not None and EXTRACTOR is not None:
-            print("Saving models for inference server...")
-            save_models(MODELS, EXTRACTOR, fold_artifacts)
-            print("✓ Models saved to disk")
+        print("Initializing Kaggle inference server...")
 
         try:
             from kaggle_evaluation.cmi_inference_server import CMIInferenceServer
 
-            print("Creating CMIInferenceServer with predict function...")
             inference_server = CMIInferenceServer(predict)
-            print("✓ Inference server created successfully")
+            print("✓ Inference server created")
 
             # 環境に応じて適切なメソッドを呼び出す
             if os.getenv("KAGGLE_IS_COMPETITION_RERUN"):
                 # 競技環境: serve()を使用
-                print("🏁 Running in COMPETITION ENVIRONMENT")
-                print("Calling inference_server.serve()...")
+                print("Running in competition environment...")
                 inference_server.serve()
-                print("✓ serve() completed successfully!")
+                print("✓ Submission complete!")
             else:
                 # ローカルテスト環境: run_local_gateway()を使用
                 print("Running in local testing mode...")
