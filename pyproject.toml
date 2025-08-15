@@ -19,4 +19,5 @@ dependencies = [
     "xgboost>=3.0.4",
     "tensorflow>=2.19.0",
     "tqdm>=4.67.1",
+    "torch>=2.8.0",
 ]
