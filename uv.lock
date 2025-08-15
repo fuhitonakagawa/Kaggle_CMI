@@ -383,6 +383,7 @@ dependencies = [
     { name = "scipy" },
     { name = "seaborn" },
     { name = "tensorflow" },
+    { name = "tensorflow-keras" },
     { name = "torch" },
     { name = "tqdm" },
     { name = "xgboost" },
@@ -402,6 +403,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.11.0" },
     { name = "seaborn", specifier = ">=0.12.0" },
     { name = "tensorflow", specifier = ">=2.19.0" },
+    { name = "tensorflow-keras", specifier = ">=0.1" },
     { name = "torch", specifier = ">=2.8.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "xgboost", specifier = ">=3.0.4" },
@@ -1542,6 +1544,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/43/9b/be27588352d7bd971696874db92d370f578715c17c0ccb27e4b13e16751e/tensorflow_io_gcs_filesystem-0.37.1-cp312-cp312-macosx_12_0_arm64.whl", hash = "sha256:fe8dcc6d222258a080ac3dfcaaaa347325ce36a7a046277f6b3e19abc1efb3c5", size = 3479614, upload-time = "2024-07-01T23:44:32.316Z" },
     { url = "https://files.pythonhosted.org/packages/d3/46/962f47af08bd39fc9feb280d3192825431a91a078c856d17a78ae4884eb1/tensorflow_io_gcs_filesystem-0.37.1-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:fbb33f1745f218464a59cecd9a18e32ca927b0f4d77abd8f8671b645cc1a182f", size = 4842077, upload-time = "2024-07-01T23:44:33.86Z" },
     { url = "https://files.pythonhosted.org/packages/f0/9b/790d290c232bce9b691391cf16e95a96e469669c56abfb1d9d0f35fa437c/tensorflow_io_gcs_filesystem-0.37.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:286389a203a5aee1a4fa2e53718c661091aa5fea797ff4fa6715ab8436b02e6c", size = 5085733, upload-time = "2024-07-01T23:44:36.663Z" },
+]
+
+[[package]]
+name = "tensorflow-keras"
+version = "0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/e8/0f5b94acf8cb70dfe90efb8fb21026684bcccec9e46d3489f83112784dc0/tensorflow_keras-0.1.tar.gz", hash = "sha256:b385c253f07266a8c6a5027a1e98550ab68fd6d1ccd1a1ff438ae3fa37c110c0", size = 4710, upload-time = "2025-01-19T19:13:18.745Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a8/f2/3390ee50e5bc4a764c51f960d99856e6c795e2945cf611cb1216254ab605/tensorflow_keras-0.1-py3-none-any.whl", hash = "sha256:f3070428c41638aaf5a97b7531908dcc35648d129b7cf9fb5f1cebd6957dd8fb", size = 5156, upload-time = "2025-01-19T19:13:16.889Z" },
 ]
 
 [[package]]
