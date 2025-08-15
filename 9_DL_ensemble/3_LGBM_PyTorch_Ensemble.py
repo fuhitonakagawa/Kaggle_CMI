@@ -1,7 +1,7 @@
-# CMI BFRB Detection - Multi-Modal (IMU+ToF+Thermal) LightGBM Training
-# This notebook trains a multi-modal LightGBM model for BFRB detection with modality dropout for robustness.
+# CMI BFRB Detection - Training
 
 # Import required libraries
+import json
 import os
 import re
 import sys
@@ -16,6 +16,17 @@ from scipy import signal
 from scipy.spatial.transform import Rotation as R
 from sklearn.metrics import f1_score
 from sklearn.model_selection import StratifiedGroupKFold
+
+# PyTorch imports (conditional)
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    print("⚠️ PyTorch not available, DL features disabled")
 
 # Try to import CMI inference server with fallback
 try:
@@ -63,7 +74,7 @@ class Config:
     # Output path
     OUTPUT_PATH = "/kaggle/working/"
 
-    # === NEW: Modality Dropout for Training ===
+    # === Modality Dropout for Training ===
     MODALITY_DROPOUT_PROB = (
         0.3  # Probability of dropping ToF/THM during training (reduced from 0.5)
     )
@@ -77,8 +88,96 @@ class Config:
     MODEL_FILENAME = "imu_lgbm_model.pkl"  # filename when we save after training
 
 
+# === Torch training/inference config ===
+class DLConfig:
+    TORCH_OUT_DIR = os.path.join(Config.OUTPUT_PATH, "torch_models")
+    N_FOLDS = Config.N_FOLDS
+    SEED = Config.SEED
+
+    # frame-level features
+    PAD_LEN_PERCENTILE = 95  # P95 を既定
+    FIXED_PAD_LEN = None  # 明示指定したい場合は整数、未指定なら上記PCTLから決める
+    FRAME_FEATURE_CACHE = os.path.join(Config.OUTPUT_PATH, "frame_features.parquet")
+
+    # training
+    MAX_EPOCHS = 30
+    BATCH_SIZE = 64  # OOM時は 32/16 に
+    ACCUM_STEPS = 1  # 勾配蓄積で実効バッチ拡張
+    LR = 1e-3
+    WEIGHT_DECAY = 1e-2
+    DROPOUT = 0.2
+    LABEL_SMOOTHING = 0.05
+
+    # runtime
+    AMP = True
+    NUM_WORKERS = 2
+
+    # file names
+    BUNDLE_NAME = "torch_bundle.pkl"  # メタ（列順、スケーラ、pad_len等）
+    WEIGHT_TMPL = "fold{:02d}.pt"  # 各foldの重み
+
+
+# === Ensemble configuration ===
+class EnsembleConfig:
+    # weights for final soft-voting
+    W_LGBM = float(os.getenv("ENSEMBLE_W_LGBM", "0.4"))
+    W_TORCH = float(os.getenv("ENSEMBLE_W_TORCH", "0.6"))
+    # torch bundle path (for inference-only)
+    TORCH_BUNDLE_PATH = os.getenv(
+        "TORCH_BUNDLE_PATH", os.path.join(DLConfig.TORCH_OUT_DIR, DLConfig.BUNDLE_NAME)
+    )
+    LOAD_TORCH_FOLDS_IN_MEMORY = bool(int(os.getenv("LOAD_TORCH_FOLDS_IN_MEMORY", "1")))
+    FAIL_IF_TORCH_MISSING = bool(int(os.getenv("FAIL_IF_TORCH_MISSING", "0")))
+
+
+# === Checkpoint/Resume configuration & helpers ===
+class CheckpointConfig:
+    CKPT_DIR = os.path.join(Config.OUTPUT_PATH, os.getenv("CKPT_DIR", "checkpoints"))
+    RESUME = bool(int(os.getenv("RESUME", "1")))  # 1: 再開する
+    FEATURES_CACHE = os.path.join(CKPT_DIR, "train_features.joblib")
+    LGBM_FOLD_TMPL = "lgbm_fold{:02d}.pkl"
+    LGBM_STATE_JSON = os.path.join(CKPT_DIR, "lgbm_state.json")
+    TORCH_EPOCH_CKPT_TMPL = os.path.join(DLConfig.TORCH_OUT_DIR, "fold{:02d}_last.pth")
+    TORCH_STATE_JSON = os.path.join(DLConfig.TORCH_OUT_DIR, "torch_state.json")
+    SKIP_TORCH_FOLD_IF_BEST_EXISTS = True  # 既に最良重みがあれば fold をスキップ
+
+
+def _save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(obj, f)
+
+
+def _load_json(path, default=None):
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {} if default is None else default
+
+
+os.makedirs(CheckpointConfig.CKPT_DIR, exist_ok=True)
+
+# Check ensemble weights are valid
+assert EnsembleConfig.W_LGBM + EnsembleConfig.W_TORCH > 0, (
+    "Invalid ensemble weights (sum must be > 0)"
+)
+
 np.random.seed(Config.SEED)
+
+# PyTorch seed setting for reproducibility
+if TORCH_AVAILABLE:
+    torch.manual_seed(Config.SEED)
+    torch.cuda.manual_seed_all(Config.SEED)
+    torch.backends.cudnn.benchmark = (
+        True  # Speed priority (set to False for deterministic)
+    )
+    print(f"✓ PyTorch seed set to {Config.SEED}")
+
 print("✓ Configuration loaded")
+print(
+    f"✓ Ensemble weights: LGBM={EnsembleConfig.W_LGBM:.2f}, Torch={EnsembleConfig.W_TORCH:.2f}"
+)
 
 # Gesture mapping
 GESTURE_MAPPER = {
@@ -1048,6 +1147,520 @@ def extract_xmod_features_for_union(
     )
 
 
+# === DL frame-level feature extraction ===
+def build_frame_features(sequence: pl.DataFrame) -> pd.DataFrame:
+    """
+    Returns DataFrame of shape (T, C) for DL, with fixed column order.
+    """
+    seq_df = sequence.to_pandas()
+    dt, fs = infer_dt_and_fs(seq_df)
+
+    # IMU 必須列の存在保証
+    for c in Config.ACC_COLS:
+        if c not in seq_df.columns:
+            seq_df[c] = 0.0
+    available_rot_cols = [c for c in Config.ROT_COLS if c in seq_df.columns]
+    if available_rot_cols:
+        rot = build_full_quaternion(seq_df, available_rot_cols)
+        rot = handle_quaternion_missing_values(rot)
+        rot = fix_quaternion_sign(rot)
+    else:
+        rot = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (len(seq_df), 1))
+
+    acc = seq_df[Config.ACC_COLS].ffill().bfill().to_numpy(dtype=float)
+    world_acc = compute_world_acceleration(acc, rot)
+    linear_acc = compute_linear_acceleration(world_acc, fs=fs)
+    omega = compute_angular_velocity(rot, dt=dt)
+
+    # magnitudes
+    lin_mag = np.linalg.norm(linear_acc, axis=1, keepdims=True)
+    omg_mag = np.linalg.norm(omega, axis=1, keepdims=True)
+
+    # ToF/THM frame aggregates
+    _, mod_cols = detect_modalities(seq_df)
+    tof_agg = tof_frame_aggregates(seq_df, mod_cols["tof"]) if mod_cols["tof"] else None
+    thm_agg = (
+        thermal_frame_aggregates(seq_df, mod_cols["thm"]) if mod_cols["thm"] else None
+    )
+
+    feats = {}
+    feats["linear_acc_x"] = linear_acc[:, 0]
+    feats["linear_acc_y"] = linear_acc[:, 1]
+    feats["linear_acc_z"] = linear_acc[:, 2]
+    feats["omega_x"] = omega[:, 0]
+    feats["omega_y"] = omega[:, 1]
+    feats["omega_z"] = omega[:, 2]
+    feats["linear_acc_mag"] = lin_mag[:, 0]
+    feats["omega_mag"] = omg_mag[:, 0]
+
+    # ToF
+    if tof_agg is not None:
+        feats["tof_mean"] = tof_agg["mean"]
+        feats["tof_std"] = tof_agg["std"]
+        feats["tof_min"] = tof_agg["min"]
+        feats["tof_max"] = tof_agg["max"]
+        feats["tof_valid_ratio"] = tof_agg["valid_ratio"]
+    else:
+        for k in ["mean", "std", "min", "max", "valid_ratio"]:
+            feats[f"tof_{k}"] = np.zeros(len(seq_df))
+
+    # THM
+    if thm_agg is not None:
+        feats["thm_mean"] = thm_agg["mean"]
+        feats["thm_std"] = thm_agg["std"]
+        feats["thm_min"] = thm_agg["min"]
+        feats["thm_max"] = thm_agg["max"]
+        feats["thm_valid_ratio"] = thm_agg["valid_ratio"]
+    else:
+        for k in ["mean", "std", "min", "max", "valid_ratio"]:
+            feats[f"thm_{k}"] = np.zeros(len(seq_df))
+
+    frame_df = pd.DataFrame(feats)
+    frame_df.replace([np.inf, -np.inf], 0, inplace=True)
+    frame_df.fillna(0, inplace=True)
+    return frame_df
+
+
+# === DL preprocessing functions ===
+def compute_scaler_stats(
+    frame_dfs: list[pd.DataFrame],
+) -> dict[str, tuple[float, float]]:
+    # 入力: 学習fold内の全 sequence の frame_df リスト
+    concat = pd.concat(frame_dfs, axis=0, ignore_index=True)
+    stats = {}
+    for c in concat.columns:
+        x = concat[c].values.astype(np.float64)
+        mu = float(np.mean(x))
+        sd = float(np.std(x) + 1e-8)
+        stats[c] = (mu, sd)
+    return stats
+
+
+def apply_standardize(df: pd.DataFrame, stats: dict) -> pd.DataFrame:
+    out = df.copy()
+    for c, (mu, sd) in stats.items():
+        if c in out.columns:
+            out[c] = (out[c].astype(np.float32) - mu) / sd
+    return out
+
+
+def decide_pad_len(lengths: list[int], fixed: int | None, pctl: int = 95) -> int:
+    if fixed is not None:
+        return int(fixed)
+    return int(np.percentile(lengths, pctl))
+
+
+def pad_and_mask(x: np.ndarray, pad_len: int) -> tuple[np.ndarray, np.ndarray]:
+    # x: (T,C) -> (pad_len, C), mask: (pad_len,) 1=valid, 0=pad
+    T, C = x.shape
+    out = np.zeros((pad_len, C), dtype=np.float32)
+    msk = np.zeros((pad_len,), dtype=np.float32)
+    t = min(T, pad_len)
+    out[:t] = x[:t]
+    msk[:t] = 1.0
+    return out, msk
+
+
+# === Torch Dataset and collate function ===
+if TORCH_AVAILABLE:
+
+    class TorchDataset(torch.utils.data.Dataset):
+        def __init__(
+            self,
+            sequences: list[pl.DataFrame],
+            labels: np.ndarray | None,
+            scaler_stats: dict,
+            pad_len: int,
+        ):
+            self.sequences = sequences
+            self.labels = labels
+            self.scaler_stats = scaler_stats
+            self.pad_len = pad_len
+
+        def __len__(self):
+            return len(self.sequences)
+
+        def __getitem__(self, idx):
+            frame_df = build_frame_features(self.sequences[idx])
+            frame_df = apply_standardize(frame_df, self.scaler_stats)
+            x = frame_df.to_numpy(dtype=np.float32)
+            x, m = pad_and_mask(x, self.pad_len)
+            y = -1 if self.labels is None else int(self.labels[idx])
+            return x, m, y
+
+    def collate_batch(batch):
+        xs, ms, ys = zip(*batch)
+        x = torch.from_numpy(np.stack(xs, 0))  # (B, T, C)
+        m = torch.from_numpy(np.stack(ms, 0))  # (B, T)
+        y = torch.tensor(ys, dtype=torch.long)
+        return x, m, y
+
+    # === DL Model (Conv → BiLSTM → GRU → Attention) ===
+    class TemporalAttention(nn.Module):
+        def __init__(self, d_model: int):
+            super().__init__()
+            self.proj = nn.Linear(d_model, 1)
+
+        def forward(self, h, mask):
+            # h: (B,T,D), mask: (B,T) 1=valid
+            logit = self.proj(h).squeeze(-1)  # (B,T)
+            logit = logit.masked_fill(mask == 0, -1e9)  # padを弾く
+            w = torch.softmax(logit, dim=1)  # (B,T)
+            pooled = torch.bmm(w.unsqueeze(1), h).squeeze(1)  # (B,D)
+            return pooled, w
+
+    class TimeSeriesNet(nn.Module):
+        def __init__(
+            self, in_ch: int, num_classes: int, hidden: int = 128, dropout: float = 0.2
+        ):
+            super().__init__()
+            self.conv = nn.Sequential(
+                nn.Conv1d(in_ch, 128, kernel_size=7, padding=3),
+                nn.BatchNorm1d(128),
+                nn.GELU(),
+                nn.MaxPool1d(2),
+                nn.Conv1d(128, 256, kernel_size=5, padding=2),
+                nn.BatchNorm1d(256),
+                nn.GELU(),
+                nn.MaxPool1d(2),
+                nn.Dropout(dropout),
+            )
+            self.bilstm = nn.LSTM(
+                256, hidden, num_layers=1, batch_first=True, bidirectional=True
+            )
+            self.gru = nn.GRU(
+                2 * hidden, hidden, num_layers=1, batch_first=True, bidirectional=True
+            )
+            self.attn = TemporalAttention(2 * hidden)
+            self.head = nn.Sequential(
+                nn.Linear(2 * hidden, 256),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(256, num_classes),
+            )
+
+        def forward(self, x, mask):
+            # x: (B,T,C) -> Conv1dは (B,C,T)
+            x = x.transpose(1, 2)
+            x = self.conv(x)  # (B, 256, T')
+            x = x.transpose(1, 2)  # (B, T', 256)
+
+            # === FIX: マスクも MaxPool と同等に2回ダウンサンプリングして T' に整合させる ===
+            m = mask  # (B, T)
+            for _ in range(2):  # conv 内の MaxPool1d を2回適用しているため
+                m = F.max_pool1d(m.unsqueeze(1), kernel_size=2, stride=2).squeeze(1)
+            m = m[:, : x.size(1)]  # 念のため長さを一致させる
+
+            h, _ = self.bilstm(x)
+            h, _ = self.gru(h)
+            pooled, w = self.attn(h, m)
+            logits = self.head(pooled)
+            return logits
+
+    # === Training utilities ===
+    def soft_ce_loss(logits, targets, smoothing=0.05, n_classes=18):
+        with torch.no_grad():
+            true_dist = torch.zeros_like(logits).fill_(smoothing / (n_classes - 1))
+            true_dist.scatter_(1, targets.unsqueeze(1), 1.0 - smoothing)
+        log_prob = F.log_softmax(logits, dim=1)
+        return -(true_dist * log_prob).sum(dim=1).mean()
+
+    def compute_torch_metrics(y_true, y_pred):
+        # Binary: 0-7 vs 8-17（既存と揃える）
+        bin_true = (y_true <= 7).astype(int)
+        bin_pred = (y_pred <= 7).astype(int)
+        binary_f1 = f1_score(bin_true, bin_pred, zero_division=0.0)
+        # Macro F1（BFRB内：0..7 のみ評価する現行式に揃えるなら調整可）
+        macro_f1 = f1_score(
+            np.where(y_true <= 7, y_true, 99),
+            np.where(y_pred <= 7, y_pred, 99),
+            average="macro",
+            zero_division=0.0,
+        )
+        return binary_f1, macro_f1, 0.5 * (binary_f1 + macro_f1)
+
+    # === Torch training function ===
+    def train_torch_models(train_df: pl.DataFrame, train_demographics: pl.DataFrame):
+        base_cols = ["sequence_id", "subject", "phase", "gesture"]
+        all_cols = train_df.columns
+        sensor_cols = (
+            [c for c in all_cols if c in Config.ACC_COLS + Config.ROT_COLS]
+            + _cols_startswith(all_cols, TOF_PREFIXES)
+            + _cols_startswith(all_cols, THM_PREFIXES)
+        )
+        cols_to_select = base_cols + sensor_cols
+        grouped = train_df.select(pl.col(cols_to_select)).group_by(
+            "sequence_id", maintain_order=True
+        )
+
+        seq_list, y_list, subj_list, lengths = [], [], [], []
+        for _, seq in grouped:
+            seq_list.append(seq)
+            y_list.append(GESTURE_MAPPER[seq["gesture"][0]])
+            subj_list.append(seq["subject"][0])
+            lengths.append(len(seq))
+
+        pad_len = decide_pad_len(
+            lengths, DLConfig.FIXED_PAD_LEN, DLConfig.PAD_LEN_PERCENTILE
+        )
+        os.makedirs(DLConfig.TORCH_OUT_DIR, exist_ok=True)
+
+        cv = StratifiedGroupKFold(
+            n_splits=DLConfig.N_FOLDS, shuffle=True, random_state=DLConfig.SEED
+        )
+        fold_weights, models_meta = [], []
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        for fold, (tr_idx, va_idx) in enumerate(
+            cv.split(seq_list, np.array(y_list), np.array(subj_list))
+        ):
+            print(f"\n--- Torch Fold {fold + 1}/{DLConfig.N_FOLDS} ---")
+            best_path = os.path.join(
+                DLConfig.TORCH_OUT_DIR, DLConfig.WEIGHT_TMPL.format(fold)
+            )
+
+            # 既に最良重みがあれば学習をスキップ（任意）
+            if CheckpointConfig.SKIP_TORCH_FOLD_IF_BEST_EXISTS and os.path.exists(
+                best_path
+            ):
+                print(
+                    f"✓ Found existing best weights for fold {fold} at {best_path} — skip training"
+                )
+                best_score = float(
+                    _load_json(CheckpointConfig.TORCH_STATE_JSON, {})
+                    .get("best_scores", {})
+                    .get(str(fold), -1.0)
+                )
+                if best_score < 0:
+                    # スコアが未記録でも重みは利用可能。暫定で 1.0 を採用
+                    best_score = 1.0
+                fold_weights.append(best_score)
+                # スケーラ統計・メタは再構築して保存に必要
+                tr_frames = [build_frame_features(seq_list[i]) for i in tr_idx]
+                scaler_stats = compute_scaler_stats(tr_frames)
+                models_meta.append(
+                    {"scaler_stats": scaler_stats, "weight_path": best_path}
+                )
+                continue
+
+            # === fold固有のスケーラ統計
+            tr_frames = [build_frame_features(seq_list[i]) for i in tr_idx]
+            scaler_stats = compute_scaler_stats(tr_frames)
+
+            ds_tr = TorchDataset(
+                [seq_list[i] for i in tr_idx],
+                np.array(y_list)[tr_idx],
+                scaler_stats,
+                pad_len,
+            )
+            ds_va = TorchDataset(
+                [seq_list[i] for i in va_idx],
+                np.array(y_list)[va_idx],
+                scaler_stats,
+                pad_len,
+            )
+            dl_tr = torch.utils.data.DataLoader(
+                ds_tr,
+                batch_size=DLConfig.BATCH_SIZE,
+                shuffle=True,
+                num_workers=DLConfig.NUM_WORKERS,
+                collate_fn=collate_batch,
+                pin_memory=True,
+            )
+            dl_va = torch.utils.data.DataLoader(
+                ds_va,
+                batch_size=DLConfig.BATCH_SIZE,
+                shuffle=False,
+                num_workers=DLConfig.NUM_WORKERS,
+                collate_fn=collate_batch,
+                pin_memory=True,
+            )
+
+            n_classes = len(GESTURE_MAPPER)
+            in_ch = tr_frames[0].shape[1]
+            model = TimeSeriesNet(
+                in_ch, n_classes, hidden=128, dropout=DLConfig.DROPOUT
+            )
+            if torch.cuda.device_count() > 1:
+                model = nn.DataParallel(model)
+            model = model.to(device)
+
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=DLConfig.LR, weight_decay=DLConfig.WEIGHT_DECAY
+            )
+            total_steps = DLConfig.MAX_EPOCHS * max(1, len(dl_tr))
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=DLConfig.LR,
+                total_steps=total_steps,
+                pct_start=0.1,
+                anneal_strategy="cos",
+            )
+            scaler = torch.cuda.amp.GradScaler(enabled=DLConfig.AMP)
+
+            # === Resume (epoch 再開)
+            epoch_start, best_score = 0, -1.0
+            last_ckpt_path = CheckpointConfig.TORCH_EPOCH_CKPT_TMPL.format(fold)
+            if bool(int(os.getenv("RESUME_TORCH", "1"))) and os.path.exists(
+                last_ckpt_path
+            ):
+                print(f"↻ Resuming fold {fold} from epoch checkpoint: {last_ckpt_path}")
+                ckpt = torch.load(last_ckpt_path, map_location=device)
+                state = ckpt["model_state"]
+                if any(k.startswith("module.") for k in state.keys()):
+                    state = {k.replace("module.", "", 1): v for k, v in state.items()}
+                model.load_state_dict(state, strict=True)
+                optimizer.load_state_dict(ckpt["optim_state"])
+                scheduler.load_state_dict(ckpt["sched_state"])
+                scaler.load_state_dict(ckpt["scaler_state"])
+                epoch_start = int(ckpt["epoch"]) + 1
+                best_score = float(ckpt.get("best_score", -1.0))
+
+            # === Train
+            for epoch in range(epoch_start, DLConfig.MAX_EPOCHS):
+                model.train()
+                for xb, mb, yb in dl_tr:
+                    xb, mb, yb = xb.to(device), mb.to(device), yb.to(device)
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.cuda.amp.autocast(enabled=DLConfig.AMP):
+                        logits = model(xb, mb)
+                        loss = soft_ce_loss(
+                            logits,
+                            yb,
+                            smoothing=DLConfig.LABEL_SMOOTHING,
+                            n_classes=n_classes,
+                        )
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+
+                # --- valid
+                model.eval()
+                all_pred, all_true = [], []
+                with torch.no_grad():
+                    for xb, mb, yb in dl_va:
+                        xb, mb = xb.to(device), mb.to(device)
+                        with torch.cuda.amp.autocast(enabled=DLConfig.AMP):
+                            logits = model(xb, mb)
+                            prob = torch.softmax(logits, dim=1)
+                        pred = prob.argmax(dim=1).cpu().numpy()
+                        all_pred.append(pred)
+                        all_true.append(yb.numpy())
+                y_true = np.concatenate(all_true)
+                y_pred = np.concatenate(all_pred)
+                bF1, mF1, score = compute_torch_metrics(y_true, y_pred)
+                print(
+                    f"  [fold {fold}] epoch {epoch + 1}/{DLConfig.MAX_EPOCHS} | score={score:.4f} (BinF1={bF1:.4f}, MacroF1={mF1:.4f})"
+                )
+
+                # Save best
+                if score > best_score:
+                    best_score = score
+                    state = (
+                        model.module.state_dict()
+                        if isinstance(model, nn.DataParallel)
+                        else model.state_dict()
+                    )
+                    torch.save(
+                        {"state_dict": state, "in_ch": in_ch, "n_classes": n_classes},
+                        best_path,
+                    )
+                    print(f"  ↳ New best! saved: {best_path}")
+
+                # Save epoch checkpoint
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state": (
+                            model.module.state_dict()
+                            if isinstance(model, nn.DataParallel)
+                            else model.state_dict()
+                        ),
+                        "optim_state": optimizer.state_dict(),
+                        "sched_state": scheduler.state_dict(),
+                        "scaler_state": scaler.state_dict(),
+                        "best_score": best_score,
+                        "best_path": best_path,
+                    },
+                    last_ckpt_path,
+                )
+
+            fold_weights.append(best_score)
+            models_meta.append({"scaler_stats": scaler_stats, "weight_path": best_path})
+
+            # Torch state json 更新
+            ts = _load_json(CheckpointConfig.TORCH_STATE_JSON, default={})
+            bs = ts.get("best_scores", {})
+            bs[str(fold)] = float(best_score)
+            ts["best_scores"] = bs
+            ts["pad_len"] = pad_len
+            _save_json(CheckpointConfig.TORCH_STATE_JSON, ts)
+
+        # 重み正規化＋バンドル保存
+        denom = max(float(np.sum(fold_weights)), 1e-12)
+        fold_w = (np.array(fold_weights) / denom).tolist()
+        bundle = {
+            "pad_len": pad_len,
+            "feature_order": list(tr_frames[0].columns),
+            "folds": [
+                {"weight": fold_w[i], **models_meta[i]} for i in range(len(models_meta))
+            ],
+            "gesture_mapper": GESTURE_MAPPER,
+            "reverse_gesture_mapper": REVERSE_GESTURE_MAPPER,
+        }
+        joblib.dump(bundle, os.path.join(DLConfig.TORCH_OUT_DIR, DLConfig.BUNDLE_NAME))
+        print("✓ Torch training done. Saved to:", DLConfig.TORCH_OUT_DIR)
+
+    # === Torch inference function ===
+    def predict_torch(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
+        # Note: demographics is not used in DL model (frame-level features only)
+        bundle_path = os.path.join(DLConfig.TORCH_OUT_DIR, DLConfig.BUNDLE_NAME)
+        if not os.path.exists(bundle_path):
+            raise FileNotFoundError(f"Torch bundle not found: {bundle_path}")
+        bundle = joblib.load(bundle_path)
+        pad_len = bundle["pad_len"]
+        feat_order = bundle["feature_order"]
+
+        # frame features -> standardize -> pad
+        frame_df = build_frame_features(sequence)
+        # 列順を合わせる（訓練時の順）
+        frame_df = frame_df.reindex(columns=feat_order).fillna(0)
+        # fold ごとに scaler が違う点に注意
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        n_classes = len(bundle["reverse_gesture_mapper"])
+        proba_accum = np.zeros(n_classes, dtype=np.float64)
+
+        for f in bundle["folds"]:
+            stats = f["scaler_stats"]
+            x_std = apply_standardize(frame_df, stats).to_numpy(np.float32)
+            x_pad, m_pad = pad_and_mask(x_std, pad_len)
+            xb = torch.from_numpy(x_pad[None, ...]).to(device)
+            mb = torch.from_numpy(m_pad[None, ...]).to(device)
+
+            ckpt = torch.load(f["weight_path"], map_location=device)
+            state = ckpt["state_dict"]
+            # remove 'module.' prefix if present
+            if any(k.startswith("module.") for k in state.keys()):
+                state = {k.replace("module.", "", 1): v for k, v in state.items()}
+            model = TimeSeriesNet(
+                in_ch=ckpt["in_ch"],
+                num_classes=ckpt["n_classes"],
+                hidden=128,
+                dropout=DLConfig.DROPOUT,
+            )
+            model.load_state_dict(state, strict=True)
+            model = model.to(device)
+            model.eval()
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=DLConfig.AMP):
+                prob = torch.softmax(model(xb, mb), dim=1).cpu().numpy()[0]
+            proba_accum += f["weight"] * prob
+
+        final_cls = int(np.argmax(proba_accum))
+        return bundle["reverse_gesture_mapper"][final_cls]
+
+
 # === Save model bundle helper ===
 def save_model_bundle(
     models, X_train, cv_scores, output_dir: str, filename: str, tof_grid_map=None
@@ -1069,7 +1682,7 @@ def save_model_bundle(
             "seed": Config.SEED,
             "lgbm_params": Config.LGBM_PARAMS,
         },
-        # NEW: Modality metadata
+        # Modality metadata
         "modalities": {"imu": True, "tof_possible": True, "thm_possible": True},
         "col_patterns": {
             "tof_prefixes": list(TOF_PREFIXES),
@@ -1235,8 +1848,15 @@ def extract_features(
         features["elbow_to_wrist_cm"] = _to_num(demo_row.get("elbow_to_wrist_cm", 0))
     else:
         # When no demographics data, still create keys with zero values for consistency
-        for k in ["age", "adult_child", "sex", "handedness", 
-                  "height_cm", "shoulder_to_wrist_cm", "elbow_to_wrist_cm"]:
+        for k in [
+            "age",
+            "adult_child",
+            "sex",
+            "handedness",
+            "height_cm",
+            "shoulder_to_wrist_cm",
+            "elbow_to_wrist_cm",
+        ]:
             features[k] = 0.0
 
     # Extract statistical features for each axis
@@ -1490,7 +2110,7 @@ def extract_features(
         )
     )
 
-    # === NEW: ToF and Thermal Features ===
+    # === ToF and Thermal Features ===
     # Detect modalities once
     _, mod_cols = detect_modalities(seq_df)
 
@@ -1658,93 +2278,129 @@ if RUN_TRAINING:
     cols_to_select = base_cols + sensor_cols
     print(f"✓ Using {len(sensor_cols)} sensor columns total")
 
-    # ------------------ FEATURE EXTRACTION ------------------
-    print("Extracting features for training sequences...")
-    train_features_list = []
-    train_labels = []
-    train_subjects = []
+    # ------------------ FEATURE EXTRACTION with CACHE ------------------
+    print("Extracting features for training sequences (with cache)...")
 
-    unique_sequences = train_df["sequence_id"].unique()
-    n_sequences = len(unique_sequences)
-    print(f"Total sequences to process: {n_sequences}")
+    features_cache_path = CheckpointConfig.FEATURES_CACHE
+    cached = CheckpointConfig.RESUME and os.path.exists(features_cache_path)
 
-    train_sequences = train_df.select(pl.col(cols_to_select)).group_by(
-        "sequence_id", maintain_order=True
-    )
+    if cached:
+        cache = joblib.load(features_cache_path)
+        X_train = cache["X_train"]
+        y_train = cache["y_train"]
+        subjects = cache["subjects"]
+        tof_grid_map = cache.get("tof_grid_map", None)
+        print(f"✓ Loaded cached features: {X_train.shape} from {features_cache_path}")
+    else:
+        train_features_list = []
+        train_labels = []
+        train_subjects = []
 
-    for i, (sequence_id, sequence_data) in enumerate(train_sequences):
-        if i % 1000 == 0:
-            print(f"Processing sequence {i + 1}/{n_sequences}")
+        unique_sequences = train_df["sequence_id"].unique()
+        n_sequences = len(unique_sequences)
+        print(f"Total sequences to process: {n_sequences}")
 
-        seq_id_val = sequence_id[0] if isinstance(sequence_id, tuple) else sequence_id
-
-        subject_id = sequence_data["subject"][0]
-        subject_demographics = train_demographics.filter(
-            pl.col("subject") == subject_id
+        train_sequences = train_df.select(pl.col(cols_to_select)).group_by(
+            "sequence_id", maintain_order=True
         )
 
-        # 前半で定義済みの extract_features() を使用（重複定義は削除済み）
-        features = extract_features(sequence_data, subject_demographics)
-        train_features_list.append(features)
+        for i, (sequence_id, sequence_data) in enumerate(train_sequences):
+            if i % 1000 == 0:
+                print(f"Processing sequence {i + 1}/{n_sequences}")
 
-        gesture = sequence_data["gesture"][0]
-        label = GESTURE_MAPPER[gesture]
-        train_labels.append(label)
-        train_subjects.append(subject_id)
+            subject_id = sequence_data["subject"][0]
+            subject_demographics = train_demographics.filter(
+                pl.col("subject") == subject_id
+            )
 
-    assert len(train_features_list) == n_sequences, (
-        f"Feature extraction failed: {len(train_features_list)} != {n_sequences}"
-    )
-    print(f"✓ Successfully processed all {n_sequences} sequences")
+            features = extract_features(sequence_data, subject_demographics)
+            train_features_list.append(features)
 
-    X_train = pd.concat(train_features_list, ignore_index=True)
-    y_train = np.array(train_labels)
-    subjects = np.array(train_subjects)
+            gesture = sequence_data["gesture"][0]
+            label = GESTURE_MAPPER[gesture]
+            train_labels.append(label)
+            train_subjects.append(subject_id)
 
-    print(f"✓ Features extracted: {X_train.shape}")
-    print(f"✓ Number of classes: {len(np.unique(y_train))}")
+        assert len(train_features_list) == n_sequences, (
+            f"Feature extraction failed: {len(train_features_list)} != {n_sequences}"
+        )
+        print(f"✓ Successfully processed all {n_sequences} sequences")
 
-    # Fix NaN/Inf values to ensure consistency between training and inference
-    print("Cleaning and standardizing features...")
-    X_train = X_train.reindex(columns=sorted(X_train.columns))
-    X_train.replace([np.inf, -np.inf], 0, inplace=True)
-    X_train.fillna(0, inplace=True)
-    
-    # Convert to float32 for memory efficiency and speed
-    X_train = X_train.astype(np.float32)
+        X_train = pd.concat(train_features_list, ignore_index=True)
+        y_train = np.array(train_labels)
+        subjects = np.array(train_subjects)
 
-    # Validate features
-    print("Validating extracted features...")
-    validate_features(X_train, verbose=True)
+        print(f"✓ Features extracted: {X_train.shape}")
+        print(f"✓ Number of classes: {len(np.unique(y_train))}")
 
-    # ------------------ CV TRAINING ------------------
-    print("Training LightGBM models with cross-validation...")
+        # Cleaning / standardize dtype
+        print("Cleaning and standardizing features...")
+        X_train = X_train.reindex(columns=sorted(X_train.columns))
+        X_train.replace([np.inf, -np.inf], 0, inplace=True)
+        X_train.fillna(0, inplace=True)
+        X_train = X_train.astype(np.float32)
+
+        # Validate features
+        print("Validating extracted features...")
+        validate_features(X_train, verbose=True)
+
+        joblib.dump(
+            {
+                "X_train": X_train,
+                "y_train": y_train,
+                "subjects": subjects,
+                "tof_grid_map": tof_grid_map,
+            },
+            features_cache_path,
+        )
+        print(f"✓ Saved features cache to {features_cache_path}")
+
+    # ------------------ CV TRAINING with CHECKPOINT ------------------
+    print("Training LightGBM models with cross-validation (with checkpoint)...")
 
     cv = StratifiedGroupKFold(
         n_splits=Config.N_FOLDS, shuffle=True, random_state=Config.SEED
     )
-    models = []
-    cv_scores = []
+    models, cv_scores = [], []
+
+    # 既存状態の読み込み
+    lgbm_state = _load_json(
+        CheckpointConfig.LGBM_STATE_JSON,
+        default={"model_paths": {}, "cv_scores": {}, "completed_folds": []},
+    )
+    completed = set(int(k) for k in lgbm_state.get("model_paths", {}).keys())
 
     for fold, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train, subjects)):
-        print(f"\n--- Fold {fold + 1}/{Config.N_FOLDS} ---")
+        model_path = os.path.join(
+            CheckpointConfig.CKPT_DIR, CheckpointConfig.LGBM_FOLD_TMPL.format(fold)
+        )
 
+        if (
+            CheckpointConfig.RESUME
+            and (fold in completed)
+            and os.path.exists(model_path)
+        ):
+            print(f"↻ Resuming: loading fold {fold} model from {model_path}")
+            model = joblib.load(model_path)
+            models.append(model)
+            cv_scores.append(float(lgbm_state["cv_scores"].get(str(fold), 0.0)))
+            continue
+
+        print(f"\n--- Fold {fold + 1}/{Config.N_FOLDS} ---")
         X_fold_train = X_train.iloc[train_idx].reset_index(drop=True).astype(np.float32)
         X_fold_val = X_train.iloc[val_idx].reset_index(drop=True).astype(np.float32)
         y_fold_train = y_train[train_idx]
         y_fold_val = y_train[val_idx]
 
-        # Apply modality dropout to training data only (not validation)
         if Config.USE_MODALITY_DROPOUT:
             print(f"Applying modality dropout with p={Config.MODALITY_DROPOUT_PROB}")
             X_fold_train = apply_modality_dropout(
                 X_fold_train,
                 dropout_prob=Config.MODALITY_DROPOUT_PROB,
-                seed=Config.SEED + fold,  # Different seed per fold
+                seed=Config.SEED + fold,
             )
 
         print(f"Train size: {len(X_fold_train)}, Val size: {len(X_fold_val)}")
-
         model = LGBMClassifier(**Config.LGBM_PARAMS)
 
         model.fit(
@@ -1759,8 +2415,11 @@ if RUN_TRAINING:
             ],
         )
 
-        models.append(model)
+        # Fold 保存（checkpoint）
+        joblib.dump(model, model_path)
+        print(f"✓ Saved fold {fold} model to {model_path}")
 
+        models.append(model)
         val_preds = model.predict(X_fold_val)
 
         binary_f1 = f1_score(
@@ -1774,13 +2433,19 @@ if RUN_TRAINING:
             average="macro",
             zero_division=0.0,
         )
-
         score = 0.5 * (binary_f1 + macro_f1)
         cv_scores.append(score)
-
         print(
             f"Fold {fold + 1} Score: {score:.4f} (Binary F1: {binary_f1:.4f}, Macro F1: {macro_f1:.4f})"
         )
+
+        # JSON 状態更新
+        lgbm_state["model_paths"][str(fold)] = model_path
+        lgbm_state["cv_scores"][str(fold)] = float(score)
+        lgbm_state["completed_folds"] = sorted(
+            list(set(lgbm_state["model_paths"].keys())), key=int
+        )
+        _save_json(CheckpointConfig.LGBM_STATE_JSON, lgbm_state)
 
     print("\n✓ Cross-validation complete!")
     print(f"Overall CV Score: {np.mean(cv_scores):.4f} ± {np.std(cv_scores):.4f}")
@@ -1807,11 +2472,32 @@ if RUN_TRAINING:
     feature_importance.to_csv(
         os.path.join(Config.OUTPUT_PATH, "feature_importance.csv"), index=False
     )
-    print("\n✓ Training complete!")
+    print("\n✓ LGBM Training complete!")
+
+    # ==== Torch training (Always try) ====
+    if TORCH_AVAILABLE:
+        print("\nStarting Torch training...")
+        train_torch_models(train_df, train_demographics)
+        print("✓ Torch training complete")
+    else:
+        msg = "PyTorch is not available. Skipping Torch training."
+        if EnsembleConfig.FAIL_IF_TORCH_MISSING:
+            raise RuntimeError(msg)
+        print("⚠️ " + msg)
 
 else:
     # ------------------ SKIP TRAINING ------------------
     path = Config.MODEL_PATH
+
+    # Check for Torch bundle
+    tbp = EnsembleConfig.TORCH_BUNDLE_PATH
+    if TORCH_AVAILABLE and os.path.exists(tbp):
+        print(f"✓ Using Torch bundle at: {tbp}")
+    else:
+        print(
+            f"ℹ️ Torch bundle not found at: {tbp} (will fall back to LGBM-only if needed)"
+        )
+
     if os.path.isdir(path):
         # MODEL_PATH is a directory, try to find the model file
         candidate = os.path.join(path, Config.MODEL_FILENAME)
@@ -1863,39 +2549,154 @@ print("Per-fold classes:", [list(getattr(m, "classes_", [])) for m in models])
 print("✓ Using previously defined feature extraction function")
 
 
-# === REPLACE: Prediction function ===
+# === Probability prediction functions for ensemble ===
+def predict_lgbm_proba(
+    sequence: pl.DataFrame, demographics: pl.DataFrame
+) -> np.ndarray:
+    """Return probability distribution over classes from LGBM models."""
+    raw_features = extract_features(sequence, demographics)
+    X = align_features_for_inference(raw_features, feature_names)
+    n_classes_global = len(reverse_gesture_mapper)
+    proba_accum = np.zeros(n_classes_global, dtype=np.float64)
+    for i, model in enumerate(models):
+        proba = model.predict_proba(X)[0]  # (local_n_classes,)
+        proba_full = np.zeros(n_classes_global, dtype=np.float64)
+        for local_idx, cls_id in enumerate(model.classes_):
+            proba_full[int(cls_id)] = proba[local_idx]
+        proba_accum += proba_full * float(fold_weights[i])
+    # Normalize (avoid floating point errors)
+    s = proba_accum.sum()
+    return proba_accum / s if s > 0 else proba_accum
+
+
+# Global cache for Torch models
+_TORCH_RUNTIME = {"bundle": None, "fold_models": []}
+
+
+def _load_torch_bundle_and_models():
+    """Load Torch bundle and optionally cache models in memory."""
+    if _TORCH_RUNTIME["bundle"] is not None:
+        return
+    bundle_path = EnsembleConfig.TORCH_BUNDLE_PATH
+    if not (TORCH_AVAILABLE and os.path.exists(bundle_path)):
+        msg = f"Torch bundle not found or torch unavailable: {bundle_path}"
+        if EnsembleConfig.FAIL_IF_TORCH_MISSING:
+            raise FileNotFoundError(msg)
+        print("⚠️ " + msg)
+        _TORCH_RUNTIME["bundle"] = None
+        return
+    bundle = joblib.load(bundle_path)
+    _TORCH_RUNTIME["bundle"] = bundle
+    if EnsembleConfig.LOAD_TORCH_FOLDS_IN_MEMORY and TORCH_AVAILABLE:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _TORCH_RUNTIME["fold_models"] = []
+        for f in bundle["folds"]:
+            ckpt = torch.load(f["weight_path"], map_location=device)
+            state = ckpt["state_dict"]
+            if any(k.startswith("module.") for k in state.keys()):
+                state = {k.replace("module.", "", 1): v for k, v in state.items()}
+            model = TimeSeriesNet(
+                in_ch=ckpt["in_ch"],
+                num_classes=ckpt["n_classes"],
+                hidden=128,
+                dropout=DLConfig.DROPOUT,
+            )
+            model.load_state_dict(state, strict=True)
+            model = model.to(device).eval()
+            _TORCH_RUNTIME["fold_models"].append(model)
+        print(f"✓ Loaded {len(_TORCH_RUNTIME['fold_models'])} Torch models into memory")
+
+
+def predict_torch_proba(
+    sequence: pl.DataFrame, demographics: pl.DataFrame
+) -> np.ndarray:
+    """Return probability distribution over classes from Torch models."""
+    _load_torch_bundle_and_models()
+    bundle = _TORCH_RUNTIME["bundle"]
+    if bundle is None:
+        return None  # Fallback indicator
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pad_len = bundle["pad_len"]
+    feat_order = bundle["feature_order"]
+    frame_df = build_frame_features(sequence).reindex(columns=feat_order).fillna(0)
+    n_classes = len(bundle["reverse_gesture_mapper"])
+    proba_accum = np.zeros(n_classes, dtype=np.float64)
+
+    for i, f in enumerate(bundle["folds"]):
+        stats = f["scaler_stats"]
+        x_std = apply_standardize(frame_df, stats).to_numpy(np.float32)
+        x_pad, m_pad = pad_and_mask(x_std, pad_len)
+        xb = torch.from_numpy(x_pad[None, ...]).to(device)
+        mb = torch.from_numpy(m_pad[None, ...]).to(device)
+
+        if EnsembleConfig.LOAD_TORCH_FOLDS_IN_MEMORY and _TORCH_RUNTIME["fold_models"]:
+            model = _TORCH_RUNTIME["fold_models"][i]
+        else:
+            ckpt = torch.load(f["weight_path"], map_location=device)
+            state = ckpt["state_dict"]
+            if any(k.startswith("module.") for k in state.keys()):
+                state = {k.replace("module.", "", 1): v for k, v in state.items()}
+            model = TimeSeriesNet(
+                in_ch=ckpt["in_ch"],
+                num_classes=ckpt["n_classes"],
+                hidden=128,
+                dropout=DLConfig.DROPOUT,
+            )
+            model.load_state_dict(state, strict=True)
+            model = model.to(device).eval()
+
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=DLConfig.AMP):
+            prob = torch.softmax(model(xb, mb), dim=1).cpu().numpy()[0]
+        proba_accum += float(f["weight"]) * prob
+
+    # Normalize
+    s = proba_accum.sum()
+    return proba_accum / s if s > 0 else proba_accum
+
+
+# === REPLACE: Prediction function with ensemble ===
 def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
     """
     Prediction function for CMI inference server.
-    Takes a single sequence and returns the predicted gesture name.
+    Always uses ensemble of LGBM and Torch models.
     """
+    # LGBM probability
     try:
-        # 1) Feature extraction (the single, unified function defined earlier)
-        raw_features = extract_features(sequence, demographics)
-
-        # 2) Align to training-time feature columns (order & presence)
-        X = align_features_for_inference(raw_features, feature_names)
-
-        # 3) Weighted-ensemble prediction with proper class alignment
-        n_classes_global = len(reverse_gesture_mapper)  # 18
-        proba_accum = np.zeros(n_classes_global, dtype=float)
-
-        for i, model in enumerate(models):
-            proba = model.predict_proba(X)[0]  # shape: (len(model.classes_),)
-            proba_full = np.zeros(n_classes_global, dtype=float)
-
-            # model.classes_ is np.array([...]) where each element is a label ID included in training
-            for local_idx, cls_id in enumerate(model.classes_):
-                proba_full[int(cls_id)] = proba[local_idx]
-
-            proba_accum += proba_full * float(fold_weights[i])
-
-        final_class = int(np.argmax(proba_accum))
-        return reverse_gesture_mapper[final_class]
-
+        proba_lgbm = predict_lgbm_proba(sequence, demographics)
     except Exception as e:
-        print(f"Prediction error: {e}")
+        print(f"⚠️ LGBM prediction error: {e}")
+        proba_lgbm = None
+
+    # Torch probability
+    proba_torch = None
+    if TORCH_AVAILABLE:
+        try:
+            proba_torch = predict_torch_proba(sequence, demographics)
+        except Exception as e:
+            print(f"⚠️ Torch prediction error: {e}")
+
+    # Ensemble weights
+    w_l, w_t = EnsembleConfig.W_LGBM, EnsembleConfig.W_TORCH
+
+    # Combine probabilities
+    if proba_torch is None and proba_lgbm is None:
+        # Both failed - return default
         return "Text on phone"
+    elif proba_torch is None:
+        # Only LGBM available
+        final_proba = proba_lgbm
+    elif proba_lgbm is None:
+        # Only Torch available
+        final_proba = proba_torch
+    else:
+        # Both available - weighted average
+        final_proba = w_l * proba_lgbm + w_t * proba_torch
+        s = final_proba.sum()
+        if s > 0:
+            final_proba /= s
+
+    final_class = int(np.argmax(final_proba))
+    return reverse_gesture_mapper[final_class]
 
 
 print("✓ Prediction function defined")
