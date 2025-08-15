@@ -1,8 +1,9 @@
-# CMI BFRB Detection - IMU-only LightGBM Training
-# This notebook trains the IMU-only LightGBM baseline model for BFRB detection.
+# CMI BFRB Detection - Multi-Modal (IMU+ToF+Thermal) LightGBM Training
+# This notebook trains a multi-modal LightGBM model for BFRB detection with modality dropout for robustness.
 
 # Import required libraries
 import os
+import re
 import sys
 import warnings
 
@@ -62,6 +63,12 @@ class Config:
     # Output path
     OUTPUT_PATH = "/kaggle/working/"
 
+    # === NEW: Modality Dropout for Training ===
+    MODALITY_DROPOUT_PROB = (
+        0.3  # Probability of dropping ToF/THM during training (reduced from 0.5)
+    )
+    USE_MODALITY_DROPOUT = True  # Enable/disable modality dropout
+
     # === Model selection ===
     # If None -> train and save; If str(path) -> skip training and use this model bundle
     MODEL_PATH = os.getenv(
@@ -106,12 +113,15 @@ ROT_IDXS = {"rot_w": 0, "rot_x": 1, "rot_y": 2, "rot_z": 3}
 def build_full_quaternion(seq_df: pd.DataFrame, available_rot_cols: list) -> np.ndarray:
     """Build a full Nx4 quaternion array from available rotation columns."""
     n = len(seq_df)
-    q = np.tile(
-        np.array([1.0, 0.0, 0.0, 0.0]), (n, 1)
-    )  # Default to identity quaternion
+    # Initialize with NaN, then set w to 1.0 as default
+    q = np.full((n, 4), np.nan, dtype=float)
+    q[:, 0] = 1.0  # rot_w defaults to 1 (identity quaternion)
+
     for c in available_rot_cols:
         if c in ROT_IDXS:
-            q[:, ROT_IDXS[c]] = seq_df[c].fillna(0).to_numpy()
+            # Keep NaN values as NaN for proper handling downstream
+            vals = seq_df[c].to_numpy(dtype=float)
+            q[:, ROT_IDXS[c]] = vals
     return q
 
 
@@ -386,9 +396,7 @@ def extract_peak_features(
         # Find peaks with prominence threshold (0.5 * std) and minimum distance
         threshold = 0.5 * np.std(data) if np.std(data) > 0 else 0.1
         min_distance = max(int(round(0.15 * fs)), 1)  # 150ms minimum between peaks
-        peaks, properties = signal.find_peaks(
-            data, prominence=threshold, distance=min_distance
-        )
+        peaks, _ = signal.find_peaks(data, prominence=threshold, distance=min_distance)
 
         features[f"{prefix}_count"] = len(peaks)
 
@@ -502,11 +510,17 @@ def extract_frequency_features(
     features = {}
 
     if len(data) < 32:  # Too short for frequency analysis
-        # Return zero features
+        # Return zero features with complete key set
         for feat in [
             "band_0.3_3",
             "band_3_8",
             "band_8_12",
+            "band_0.3_3_rel",
+            "band_3_8_rel",
+            "band_8_12_rel",
+            "band_0.3_3_log",
+            "band_3_8_log",
+            "band_8_12_log",
             "total_power",
             "spectral_centroid",
             "spectral_rolloff",
@@ -711,10 +725,326 @@ def extract_tail_window_features(
 
 print("✓ Feature engineering functions defined")
 
+# Modality detection utilities
+TOF_PREFIXES = ("tof", "time_of_flight", "tof_px", "tof_dist")
+THM_PREFIXES = ("thermal", "thm", "temp", "ir")
+
+
+def _cols_startswith(df_cols, prefixes):
+    """Find columns that start with any of the given prefixes (case-insensitive)."""
+    prefixes = tuple(p.lower() for p in prefixes)
+    return [c for c in df_cols if c.lower().startswith(prefixes)]
+
+
+def detect_modalities(seq_df: pd.DataFrame):
+    """Detect which modalities are present in the dataframe."""
+    cols = list(seq_df.columns)
+    imu_acc = [c for c in cols if c in Config.ACC_COLS]
+    imu_rot = [c for c in cols if c in Config.ROT_COLS]
+    tof_cols = _cols_startswith(cols, TOF_PREFIXES)
+    thm_cols = _cols_startswith(cols, THM_PREFIXES)
+    present = {
+        "imu": len(imu_acc) == 3 and len(imu_rot) == 4,
+        "tof": len(tof_cols) > 0,
+        "thm": len(thm_cols) > 0,
+    }
+    return present, {"tof": tof_cols, "thm": thm_cols}
+
+
+def build_tof_grid_index(tof_cols):
+    """Build a mapping from ToF column names to 8x8 grid coordinates."""
+    # Example: "tof_r3_c7" or "tof_px27" -> (row, col)
+    grid_map = {}
+    for c in tof_cols:
+        m = re.search(r"r(\d+).*?c(\d+)", c, flags=re.IGNORECASE)
+        if m:
+            r, col = int(m.group(1)), int(m.group(2))
+        else:
+            m2 = re.search(r"px(\d+)", c, flags=re.IGNORECASE)
+            if m2:
+                k = int(m2.group(1))  # 0..63
+                r, col = divmod(k, 8)
+            else:
+                r = col = None  # Unknown -> treat as flat later
+        grid_map[c] = (r, col)
+    # Only use 8x8 grid if all coordinates can be determined
+    ok = all(v[0] is not None for v in grid_map.values())
+    return grid_map if ok else None
+
+
+def _safe_nan_to_num(a):
+    """Convert array to float and replace non-finite values with NaN."""
+    a = np.asarray(a, float)
+    a[~np.isfinite(a)] = np.nan
+    return a
+
+
+def tof_frame_aggregates(seq_df: pd.DataFrame, tof_cols: list, invalid_val=-1.0):
+    """Extract frame-level aggregates from ToF data."""
+    if not tof_cols:
+        return None  # No modality
+    A = _safe_nan_to_num(seq_df[tof_cols].values)  # (T, P)
+    valid = (A != invalid_val) & np.isfinite(A)
+    valid_count = valid.sum(axis=1).astype(float)
+
+    # Statistics only on valid values
+    def safe_stat(fn, fill=0.0):
+        with np.errstate(all="ignore"):
+            x = fn(np.where(valid, A, np.nan), axis=1)
+        x = np.nan_to_num(x, nan=fill)
+        return x
+
+    agg = {
+        "mean": safe_stat(np.nanmean),
+        "std": safe_stat(np.nanstd),
+        "min": safe_stat(np.nanmin, fill=np.inf),
+        "max": safe_stat(np.nanmax, fill=-np.inf),
+        "valid_ratio": np.nan_to_num(valid_count / A.shape[1], nan=0.0),
+    }
+    agg["min"][~np.isfinite(agg["min"])] = 0.0
+    agg["max"][~np.isfinite(agg["max"])] = 0.0
+    return agg  # Each key has (T,) vector
+
+
+def tof_spatial_features_per_timestep(
+    A_t: np.ndarray, grid_map: dict, invalid_val=-1.0
+):
+    """Extract spatial features from a single timestep of ToF data."""
+    # A_t: (P,) single timestep, grid_map: {col: (r,c)}
+    # Reconstruct 8x8 grid
+    M = np.full((8, 8), np.nan, float)
+    for j, (r, c) in ((j, grid_map[col]) for j, col in enumerate(grid_map.keys())):
+        if r is not None:
+            M[r, c] = A_t[j]
+    V = np.isfinite(M) & (M != invalid_val)
+    if V.sum() == 0:
+        return dict(cx=0, cy=0, mu20=0, mu02=0, mu11=0, ecc=0, lr_asym=0, ud_asym=0)
+    # Center of mass
+    yy, xx = np.indices(M.shape)
+    W = np.where(V, M, np.nan)  # Can use weights or 1.0
+    W = np.nan_to_num(W, nan=0.0)
+    s = W.sum()
+    cx = float((W * xx).sum() / (s + 1e-9))
+    cy = float((W * yy).sum() / (s + 1e-9))
+    # Central moments
+    dx, dy = xx - cx, yy - cy
+    mu20 = float((W * dx * dx).sum() / (s + 1e-9))
+    mu02 = float((W * dy * dy).sum() / (s + 1e-9))
+    mu11 = float((W * dx * dy).sum() / (s + 1e-9))
+    # Eccentricity (simple)
+    ecc = float(((mu20 - mu02) ** 2 + 4 * mu11**2) ** 0.5 / (mu20 + mu02 + 1e-9))
+    # Left/right and up/down asymmetry (mean difference)
+    left = np.nanmean(np.where(V[:, :4], M[:, :4], np.nan))
+    right = np.nanmean(np.where(V[:, 4:], M[:, 4:], np.nan))
+    up = np.nanmean(np.where(V[:4, :], M[:4, :], np.nan))
+    down = np.nanmean(np.where(V[4:, :], M[4:, :], np.nan))
+    lr_asym = float(np.nan_to_num(left - right))
+    ud_asym = float(np.nan_to_num(up - down))
+    return dict(
+        cx=cx,
+        cy=cy,
+        mu20=mu20,
+        mu02=mu02,
+        mu11=mu11,
+        ecc=ecc,
+        lr_asym=lr_asym,
+        ud_asym=ud_asym,
+    )
+
+
+def summarize_series_features(series_dict: dict, fs: float, prefix: str) -> dict:
+    """Summarize time series into statistical and frequency features."""
+    feats = {}
+    for name, x in series_dict.items():
+        feats.update(extract_statistical_features(x, f"{prefix}_{name}"))
+        feats.update(extract_peak_features(x, f"{prefix}_{name}_peak", fs=fs))
+        feats.update(extract_autocorrelation_features(x, prefix=f"{prefix}_{name}_ac"))
+        feats.update(
+            extract_frequency_features(
+                x, fs=fs, prefix=f"{prefix}_{name}_freq", compute_zcr=False
+            )
+        )
+    return feats
+
+
+def thermal_frame_aggregates(seq_df: pd.DataFrame, thm_cols: list):
+    """Extract frame-level aggregates from thermal data."""
+    if not thm_cols:
+        return None
+    A = _safe_nan_to_num(seq_df[thm_cols].values)  # (T, C)
+    valid = np.isfinite(A)
+    valid_count = valid.sum(axis=1).astype(float)
+
+    def safe_stat(fn, fill=0.0):
+        with np.errstate(all="ignore"):
+            x = fn(np.where(valid, A, np.nan), axis=1)
+        return np.nan_to_num(x, nan=fill)
+
+    agg = {
+        "mean": safe_stat(np.nanmean),
+        "std": safe_stat(np.nanstd),
+        "min": safe_stat(np.nanmin, fill=np.inf),
+        "max": safe_stat(np.nanmax, fill=-np.inf),
+        "valid_ratio": np.nan_to_num(valid_count / A.shape[1], nan=0.0),
+    }
+    agg["min"][~np.isfinite(agg["min"])] = 0.0
+    agg["max"][~np.isfinite(agg["max"])] = 0.0
+
+    # Hotspot ratio (values exceeding mean+kσ at each timestep)
+    k = 1.0
+    thr = agg["mean"][:, None] + k * (agg["std"][:, None])
+    hotspot = (A > np.nan_to_num(thr, nan=np.inf)).sum(axis=1) / (A.shape[1] + 1e-9)
+    agg["hotspot_ratio"] = np.nan_to_num(hotspot, nan=0.0)
+    return agg
+
+
+def xmod_features(imu_series: dict, tof_series: dict | None, thm_series: dict | None):
+    """Extract cross-modality features (correlations and ratios)."""
+    feats = {}
+    # Example: linear acceleration and angular velocity magnitudes (computed in IMU)
+    lin = imu_series.get("linear_acc_mag")  # (T,)
+    omg = imu_series.get("angular_vel_mag")  # (T,)
+    if tof_series is not None:
+        tmin = tof_series.get("min")  # (T,)
+        tratio = tof_series.get("valid_ratio")  # (T,)
+        if lin is not None and tmin is not None and len(lin) > 1 and len(tmin) > 1:
+            feats["xmod_corr_linear_to_tofmin"] = float(np.corrcoef(lin, tmin)[0, 1])
+        if omg is not None and tratio is not None and len(omg) > 1 and len(tratio) > 1:
+            feats["xmod_corr_omega_to_tofvalid"] = float(np.corrcoef(omg, tratio)[0, 1])
+    if thm_series is not None and lin is not None:
+        tmean = thm_series.get("mean")
+        if tmean is not None and len(lin) > 1 and len(tmean) > 1:
+            feats["xmod_corr_linear_to_thmmean"] = float(np.corrcoef(lin, tmean)[0, 1])
+    # Replace NaN with 0
+    for k, v in list(feats.items()):
+        if not np.isfinite(v):
+            feats[k] = 0.0
+    return feats
+
+
+def extract_tof_features(
+    seq_df: pd.DataFrame, fs: float, tof_cols: list = None
+) -> dict:
+    """Extract ToF features from sequence dataframe."""
+    if tof_cols is None:
+        _, cols = detect_modalities(seq_df)
+        tof_cols = cols["tof"]
+    feats = {}
+    feats["mod_present_tof"] = 1 if (len(tof_cols) > 0) else 0
+    if not tof_cols:
+        return feats
+
+    agg = tof_frame_aggregates(seq_df, tof_cols)
+    if agg is None:
+        return feats
+
+    # Missing indicators
+    feats["tof_valid_ratio_mean"] = float(np.mean(agg["valid_ratio"]))
+    feats.update(summarize_series_features(agg, fs, prefix="tof_seq"))
+
+    # 8x8 spatial features (if possible)
+    grid_map = build_tof_grid_index(tof_cols)
+    if grid_map is not None:
+        # Extract spatial features for each timestep
+        A = seq_df[tof_cols].values
+        series_spatial = {
+            k: []
+            for k in ["cx", "cy", "mu20", "mu02", "mu11", "ecc", "lr_asym", "ud_asym"]
+        }
+        for t in range(len(seq_df)):
+            f = tof_spatial_features_per_timestep(A[t], grid_map)
+            for k in series_spatial:
+                series_spatial[k].append(f[k])
+        series_spatial = {k: np.asarray(v) for k, v in series_spatial.items()}
+        feats.update(
+            summarize_series_features(series_spatial, fs, prefix="tof_spatial")
+        )
+    return feats
+
+
+def extract_thm_features(
+    seq_df: pd.DataFrame, fs: float, thm_cols: list = None
+) -> dict:
+    """Extract thermal features from sequence dataframe."""
+    if thm_cols is None:
+        _, cols = detect_modalities(seq_df)
+        thm_cols = cols["thm"]
+    feats = {}
+    feats["mod_present_thm"] = 1 if (len(thm_cols) > 0) else 0
+    if not thm_cols:
+        return feats
+    agg = thermal_frame_aggregates(seq_df, thm_cols)
+    if agg is None:
+        return feats
+    feats["thm_valid_ratio_mean"] = float(np.mean(agg["valid_ratio"]))
+    feats.update(summarize_series_features(agg, fs, prefix="thm_seq"))
+    return feats
+
+
+def apply_modality_dropout(
+    features_df: pd.DataFrame, dropout_prob: float = 0.5, seed: int = None
+) -> pd.DataFrame:
+    """Apply modality dropout to ToF and Thermal features for training robustness."""
+    # Use local RNG to avoid affecting global random state
+    rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+
+    df_copy = features_df.copy()
+
+    # Randomly decide whether to drop ToF/THM for each sample
+    n_samples = len(df_copy)
+    drop_tof = rng.random(n_samples) < dropout_prob
+    drop_thm = rng.random(n_samples) < dropout_prob
+
+    # Find ToF and THM feature columns
+    tof_cols = [
+        col
+        for col in df_copy.columns
+        if col.startswith("tof_") and col != "mod_present_tof"
+    ]
+    thm_cols = [
+        col
+        for col in df_copy.columns
+        if col.startswith("thm_") and col != "mod_present_thm"
+    ]
+    xmod_cols = [col for col in df_copy.columns if col.startswith("xmod_")]
+
+    # Apply dropout
+    for i in range(n_samples):
+        if drop_tof[i]:
+            df_copy.loc[i, tof_cols] = 0
+            df_copy.loc[i, "mod_present_tof"] = 0
+            # Also drop cross-modality features involving ToF
+            tof_xmod_cols = [col for col in xmod_cols if "tof" in col.lower()]
+            df_copy.loc[i, tof_xmod_cols] = 0
+
+        if drop_thm[i]:
+            df_copy.loc[i, thm_cols] = 0
+            df_copy.loc[i, "mod_present_thm"] = 0
+            # Also drop cross-modality features involving THM
+            thm_xmod_cols = [col for col in xmod_cols if "thm" in col.lower()]
+            df_copy.loc[i, thm_xmod_cols] = 0
+
+    return df_copy
+
+
+def extract_xmod_features_for_union(
+    imu_series: dict, tof_agg: dict | None, thm_agg: dict | None
+) -> dict:
+    """Extract cross-modality features for the union of modalities."""
+    # imu_series should contain linear_acc_mag, angular_vel_mag from extract_features
+    return xmod_features(
+        {
+            "linear_acc_mag": imu_series.get("linear_acc_mag"),
+            "angular_vel_mag": imu_series.get("angular_vel_mag"),
+        },
+        tof_series=tof_agg,
+        thm_series=thm_agg,
+    )
+
 
 # === Save model bundle helper ===
 def save_model_bundle(
-    models, X_train, cv_scores, output_dir: str, filename: str
+    models, X_train, cv_scores, output_dir: str, filename: str, tof_grid_map=None
 ) -> str:
     # Normalize fold weights（ゼロ除算対策）
     denom = max(float(np.sum(cv_scores)), 1e-12)
@@ -733,6 +1063,13 @@ def save_model_bundle(
             "seed": Config.SEED,
             "lgbm_params": Config.LGBM_PARAMS,
         },
+        # NEW: Modality metadata
+        "modalities": {"imu": True, "tof_possible": True, "thm_possible": True},
+        "col_patterns": {
+            "tof_prefixes": list(TOF_PREFIXES),
+            "thm_prefixes": list(THM_PREFIXES),
+        },
+        "tof_grid_map": tof_grid_map,  # Will be None if ToF columns can't be mapped to grid
     }
 
     os.makedirs(output_dir, exist_ok=True)
@@ -751,8 +1088,9 @@ def align_features_for_inference(
         if col not in result_df.columns:
             result_df[col] = 0
     # extra cols are dropped by selecting in order
-    result_df = result_df[feature_names]
-    return result_df.fillna(0)
+    result_df = result_df[feature_names].fillna(0)
+    # Convert to float32 for memory efficiency and consistency
+    return result_df.astype(np.float32)
 
 
 def extract_statistical_features(data: np.ndarray, prefix: str) -> dict:
@@ -869,16 +1207,31 @@ def extract_features(
     # Sequence metadata
     features["sequence_length"] = len(seq_df)
 
-    # Demographics features
+    # Demographics features with safe numeric conversion
     if len(demo_df) > 0:
         demo_row = demo_df.iloc[0]
-        features["age"] = demo_row.get("age", 0)
-        features["adult_child"] = demo_row.get("adult_child", 0)
-        features["sex"] = demo_row.get("sex", 0)
-        features["handedness"] = demo_row.get("handedness", 0)
-        features["height_cm"] = demo_row.get("height_cm", 0)
-        features["shoulder_to_wrist_cm"] = demo_row.get("shoulder_to_wrist_cm", 0)
-        features["elbow_to_wrist_cm"] = demo_row.get("elbow_to_wrist_cm", 0)
+
+        def _to_num(x, default=0.0):
+            """Safely convert value to numeric."""
+            try:
+                return float(x)
+            except Exception:
+                return default
+
+        features["age"] = _to_num(demo_row.get("age", 0))
+        features["adult_child"] = _to_num(demo_row.get("adult_child", 0))
+        features["sex"] = _to_num(demo_row.get("sex", 0))
+        features["handedness"] = _to_num(demo_row.get("handedness", 0))
+        features["height_cm"] = _to_num(demo_row.get("height_cm", 0))
+        features["shoulder_to_wrist_cm"] = _to_num(
+            demo_row.get("shoulder_to_wrist_cm", 0)
+        )
+        features["elbow_to_wrist_cm"] = _to_num(demo_row.get("elbow_to_wrist_cm", 0))
+    else:
+        # When no demographics data, still create keys with zero values for consistency
+        for k in ["age", "adult_child", "sex", "handedness", 
+                  "height_cm", "shoulder_to_wrist_cm", "elbow_to_wrist_cm"]:
+            features[k] = 0.0
 
     # Extract statistical features for each axis
     for i, axis in enumerate(["x", "y", "z"]):
@@ -1131,6 +1484,41 @@ def extract_features(
         )
     )
 
+    # === NEW: ToF and Thermal Features ===
+    # Detect modalities once
+    _, mod_cols = detect_modalities(seq_df)
+
+    # Extract ToF features
+    tof_features = extract_tof_features(seq_df, fs, tof_cols=mod_cols["tof"])
+    features.update(tof_features)
+
+    # Extract Thermal features
+    thm_features = extract_thm_features(seq_df, fs, thm_cols=mod_cols["thm"])
+    features.update(thm_features)
+
+    # Extract cross-modality features
+    # First prepare IMU series for cross-modality
+    imu_series = {
+        "linear_acc_mag": linear_acc_magnitude,
+        "angular_vel_mag": angular_vel_magnitude,
+    }
+
+    # Get ToF and THM aggregates for cross-modality (if they exist)
+    tof_agg = None
+    if mod_cols["tof"]:
+        tof_agg = tof_frame_aggregates(seq_df, mod_cols["tof"])
+
+    thm_agg = None
+    if mod_cols["thm"]:
+        thm_agg = thermal_frame_aggregates(seq_df, mod_cols["thm"])
+
+    # Extract cross-modality features
+    xmod_feats = extract_xmod_features_for_union(imu_series, tof_agg, thm_agg)
+    features.update(xmod_feats)
+
+    # Add IMU modality flag (always present in this dataset)
+    features["mod_present_imu"] = 1
+
     # Convert to DataFrame
     result_df = pd.DataFrame([features])
     result_df = result_df.fillna(0)
@@ -1139,6 +1527,81 @@ def extract_features(
 
 
 print("✓ Feature extraction function defined")
+
+
+def validate_features(
+    features_df: pd.DataFrame, feature_names: list = None, verbose: bool = True
+) -> bool:
+    """Validate extracted features for data integrity."""
+    is_valid = True
+
+    # Check 1: No NaN or Inf values
+    if features_df.isnull().any().any():
+        if verbose:
+            print("❌ Warning: NaN values found in features")
+            print(features_df.columns[features_df.isnull().any()].tolist())
+        is_valid = False
+
+    if np.isinf(features_df.values).any():
+        if verbose:
+            print("❌ Warning: Inf values found in features")
+        is_valid = False
+
+    # Check 2: IMU modality should always be present
+    if "mod_present_imu" in features_df.columns:
+        if not (features_df["mod_present_imu"] == 1).all():
+            if verbose:
+                print("❌ Warning: IMU modality not present in some samples")
+            is_valid = False
+
+    # Check 3: Feature names match expected (if provided)
+    if feature_names is not None:
+        missing_cols = set(feature_names) - set(features_df.columns)
+        if missing_cols:
+            if verbose:
+                print(f"❌ Warning: Missing expected features: {missing_cols}")
+            is_valid = False
+
+    # Check 4: Modality consistency
+    tof_cols = [
+        c
+        for c in features_df.columns
+        if c.startswith("tof_") and c != "mod_present_tof"
+    ]
+    thm_cols = [
+        c
+        for c in features_df.columns
+        if c.startswith("thm_") and c != "mod_present_thm"
+    ]
+
+    for idx in range(len(features_df)):
+        # If mod_present_tof is 0, all ToF features should be 0
+        if (
+            "mod_present_tof" in features_df.columns
+            and features_df.iloc[idx]["mod_present_tof"] == 0
+        ):
+            if tof_cols and (features_df.iloc[idx][tof_cols] != 0).any():
+                if verbose and idx == 0:  # Only warn once
+                    print("❌ Warning: ToF features non-zero when modality is absent")
+                is_valid = False
+
+        # Same for thermal
+        if (
+            "mod_present_thm" in features_df.columns
+            and features_df.iloc[idx]["mod_present_thm"] == 0
+        ):
+            if thm_cols and (features_df.iloc[idx][thm_cols] != 0).any():
+                if verbose and idx == 0:  # Only warn once
+                    print(
+                        "❌ Warning: Thermal features non-zero when modality is absent"
+                    )
+                is_valid = False
+
+    if verbose and is_valid:
+        print("✓ Feature validation passed")
+
+    return is_valid
+
 
 # === REPLACE: Training block guarded by MODEL_PATH ===
 RUNTIME_MODEL_PATH = None
@@ -1153,12 +1616,41 @@ if RUN_TRAINING:
     print(f"✓ Train shape: {train_df.shape}")
     print(f"✓ Demographics shape: {train_demographics.shape}")
 
-    imu_cols = (
-        ["sequence_id", "subject", "phase", "gesture"]
-        + Config.ACC_COLS
-        + Config.ROT_COLS
-    )
-    print(f"✓ Using {len(imu_cols)} IMU columns")
+    # Get all available columns (including ToF/THM if present)
+    base_cols = ["sequence_id", "subject", "phase", "gesture"]
+
+    # Detect all sensor columns in training data
+    all_cols = train_df.columns
+    sensor_cols = []
+
+    # Add IMU columns
+    sensor_cols.extend([c for c in all_cols if c in Config.ACC_COLS])
+    sensor_cols.extend([c for c in all_cols if c in Config.ROT_COLS])
+
+    # Add ToF columns if present
+    tof_cols_found = _cols_startswith(all_cols, TOF_PREFIXES)
+    tof_grid_map = None
+    if tof_cols_found:
+        print(f"✓ Found {len(tof_cols_found)} ToF columns")
+        sensor_cols.extend(tof_cols_found)
+        # Try to build ToF grid map for metadata
+        tof_grid_map = build_tof_grid_index(tof_cols_found)
+        if tof_grid_map:
+            print("✓ ToF columns can be mapped to 8x8 grid")
+    else:
+        print("ℹ️ No ToF columns found in training data")
+
+    # Add Thermal columns if present
+    thm_cols_found = _cols_startswith(all_cols, THM_PREFIXES)
+    if thm_cols_found:
+        print(f"✓ Found {len(thm_cols_found)} Thermal columns")
+        sensor_cols.extend(thm_cols_found)
+    else:
+        print("ℹ️ No Thermal columns found in training data")
+
+    # Combine all columns
+    cols_to_select = base_cols + sensor_cols
+    print(f"✓ Using {len(sensor_cols)} sensor columns total")
 
     # ------------------ FEATURE EXTRACTION ------------------
     print("Extracting features for training sequences...")
@@ -1170,7 +1662,7 @@ if RUN_TRAINING:
     n_sequences = len(unique_sequences)
     print(f"Total sequences to process: {n_sequences}")
 
-    train_sequences = train_df.select(pl.col(imu_cols)).group_by(
+    train_sequences = train_df.select(pl.col(cols_to_select)).group_by(
         "sequence_id", maintain_order=True
     )
 
@@ -1206,6 +1698,19 @@ if RUN_TRAINING:
     print(f"✓ Features extracted: {X_train.shape}")
     print(f"✓ Number of classes: {len(np.unique(y_train))}")
 
+    # Fix NaN/Inf values to ensure consistency between training and inference
+    print("Cleaning and standardizing features...")
+    X_train = X_train.reindex(columns=sorted(X_train.columns))
+    X_train.replace([np.inf, -np.inf], 0, inplace=True)
+    X_train.fillna(0, inplace=True)
+    
+    # Convert to float32 for memory efficiency and speed
+    X_train = X_train.astype(np.float32)
+
+    # Validate features
+    print("Validating extracted features...")
+    validate_features(X_train, verbose=True)
+
     # ------------------ CV TRAINING ------------------
     print("Training LightGBM models with cross-validation...")
 
@@ -1218,10 +1723,19 @@ if RUN_TRAINING:
     for fold, (train_idx, val_idx) in enumerate(cv.split(X_train, y_train, subjects)):
         print(f"\n--- Fold {fold + 1}/{Config.N_FOLDS} ---")
 
-        X_fold_train = X_train.iloc[train_idx]
-        X_fold_val = X_train.iloc[val_idx]
+        X_fold_train = X_train.iloc[train_idx].astype(np.float32)
+        X_fold_val = X_train.iloc[val_idx].astype(np.float32)
         y_fold_train = y_train[train_idx]
         y_fold_val = y_train[val_idx]
+
+        # Apply modality dropout to training data only (not validation)
+        if Config.USE_MODALITY_DROPOUT:
+            print(f"Applying modality dropout with p={Config.MODALITY_DROPOUT_PROB}")
+            X_fold_train = apply_modality_dropout(
+                X_fold_train,
+                dropout_prob=Config.MODALITY_DROPOUT_PROB,
+                seed=Config.SEED + fold,  # Different seed per fold
+            )
 
         print(f"Train size: {len(X_fold_train)}, Val size: {len(X_fold_val)}")
 
@@ -1272,6 +1786,7 @@ if RUN_TRAINING:
         cv_scores=cv_scores,
         output_dir=Config.OUTPUT_PATH,
         filename=Config.MODEL_FILENAME,
+        tof_grid_map=tof_grid_map,  # Pass ToF grid mapping if available
     )
 
     # （任意）特徴量重要度の保存
@@ -1314,7 +1829,7 @@ else:
         )
 
 
-# # CMI BFRB Detection - IMU-only LightGBM Inference
+# # CMI BFRB Detection - Multi-Modal LightGBM Inference
 
 # === REPLACE: Load model bundle for inference ===
 print("Loading model bundle for inference...")
