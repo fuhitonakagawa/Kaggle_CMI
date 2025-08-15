@@ -3654,14 +3654,18 @@ if __name__ == "__main__":
 
     # モデルを訓練
     MODELS, EXTRACTOR, metrics = train_models()
-    print("✓ Models trained successfully")
-    print(
-        f"   Binary F1: {metrics['mean_binary_f1']:.4f} ± {metrics['std_binary_f1']:.4f}"
-    )
-    print(
-        f"   Macro F1:  {metrics['mean_macro_f1']:.4f} ± {metrics['std_macro_f1']:.4f}"
-    )
-    print(f"   CV Score:  {metrics['mean_score']:.4f} ± {metrics['std_score']:.4f}")
+    if USE_PRETRAINED_MODEL:
+        print("✓ Pretrained models loaded successfully")
+        print("   No training metrics available (using pretrained models)")
+    else:
+        print("✓ Models trained successfully")
+        print(
+            f"   Binary F1: {metrics['mean_binary_f1']:.4f} ± {metrics['std_binary_f1']:.4f}"
+        )
+        print(
+            f"   Macro F1:  {metrics['mean_macro_f1']:.4f} ± {metrics['std_macro_f1']:.4f}"
+        )
+        print(f"   CV Score:  {metrics['mean_score']:.4f} ± {metrics['std_score']:.4f}")
 
     # Show performance summary
     print("\n" + "=" * 70)

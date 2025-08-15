@@ -125,13 +125,11 @@ if __name__ == "__main__":
 # ====================================================================================================
 
 # 🔧 メイン環境スイッチ - KaggleとローカルMacの切り替え
-IS_KAGGLE_ENV = True  # True: Kaggle環境、False: ローカルMacBook
+IS_KAGGLE_ENV = False  # True: Kaggle環境、False: ローカルMacBook
 
 # ⚙️ 特徴量抽出設定
 # 動作を制御する変数:
-USE_EXPORTED_FEATURES = (
-    True  # True: 特徴量抽出をスキップしてエクスポート済みデータを使用
-)
+USE_EXPORTED_FEATURES = False  # False: ラベル不整合を避けるため、毎回生データから抽出
 EXPORT_FEATURES = False  # True: 特徴量をエクスポート（初回実行時）
 EXPORT_NAME = None  # エクスポート名（None = タイムスタンプ自動生成）
 
@@ -140,7 +138,7 @@ USE_PARALLEL = True  # True: 並列処理を使用（ローカル環境のみ有
 N_JOBS = -1  # 並列処理のワーカー数 (-1: 全コア使用, 正の整数: 指定数のコア使用)
 
 # 🔧 学習済モデル設定
-USE_PRETRAINED_MODEL = True  # True: 学習済モデルをロード、False: 新規に学習
+USE_PRETRAINED_MODEL = False  # False: 新規に学習（Notebookと同条件）
 PRETRAINED_MODEL_PATH = "/kaggle/input/cmi-bfrb-v6-2-xgboost/other/default/1/models.pkl"  # 学習済モデルファイルのパス（None = 自動検出）
 PRETRAINED_EXTRACTOR_PATH = "/kaggle/input/cmi-bfrb-v6-2-xgboost/other/default/1/extractor.pkl"  # 学習済Extractorファイルのパス（None = 自動検出）
 PRETRAINED_ARTIFACTS_PATH = "/kaggle/input/cmi-bfrb-v6-2-xgboost/other/default/1/fold_artifacts.pkl"  # fold artifactsファイルのパス（None = 自動検出）
@@ -254,7 +252,7 @@ CONFIG = {
     "tof_pca_components": 8,
     "tof_valid_threshold": 0.2,
     "tof_outlier_percentile": (1, 99),
-    "tof_use_pca": True,
+    "tof_use_pca": True,  # 【修正】PCAを有効化
     "tof_use_handedness_mirror": True,  # Mirror ToF based on handedness
     "tof_region_analysis": True,  # Analyze different spatial regions
     # Frequency analysis
@@ -270,18 +268,18 @@ CONFIG = {
     "xgb_params": {
         "objective": "multi:softprob",
         "num_class": 18,
-        "n_estimators": 1000,
-        "max_depth": 10,
+        "n_estimators": 2000,  # 【修正】1000→2000
+        "max_depth": 8,  # 【修正】10→8（過学習抑制）
         "learning_rate": 0.03,
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "gamma": 0.1,
+        "subsample": 0.75,  # 【修正】0.8→0.75
+        "colsample_bytree": 0.7,  # 【修正】0.8→0.7
+        "gamma": 0.05,  # 【修正】0.1→0.05（細かい枝を抑えすぎない）
         "reg_alpha": 0.1,
-        "reg_lambda": 1.0,
-        "min_child_weight": 3,
+        "reg_lambda": 2.0,  # 【修正】1.0→2.0（正則化強化）
+        "min_child_weight": 5,  # 【修正】3→5（過学習抑制）
         "random_state": 42,
         "n_jobs": -1,
-        "early_stopping_rounds": 50,
+        "early_stopping_rounds": 100,  # 【修正】50→100
     },
 }
 
@@ -1940,6 +1938,10 @@ class FeatureExtractor:
 
         # ステップ2: PCAを含む最終形の特徴を抽出
         print("    Extracting final features with PCA...")
+        
+        # 【重要修正】PCAを含む特徴を取得するため、一時的にis_fitted=Trueに設定
+        self.is_fitted = True
+        
         final_features = []
         for i in range(len(sequences)):
             seq_df = sequences[i]
@@ -2403,16 +2405,6 @@ class FeatureExtractor:
                     features[key] = 0
 
         return pd.DataFrame([features])
-
-    def _extract_features_raw(
-        self, sequence_df: pd.DataFrame, demographics_df: pd.DataFrame
-    ) -> pd.DataFrame:
-        """
-        シーケンスから生の特徴量を抽出する（スケーリングなし）。
-        これはpredict関数でfold毎のスケーラーを適用する前に使用される。
-        """
-        # extract_featuresと同じ処理を行うが、スケーリングはしない
-        return self.extract_features(sequence_df, demographics_df)
 
     def extract_features(
         self, sequence_df: pd.DataFrame, demographics_df: pd.DataFrame
@@ -3174,6 +3166,18 @@ def train_models():
         f"Loaded {len(train_df)} samples from {train_df['sequence_id'].nunique()} sequences"
     )
 
+    # handedness の型を確認して数値化
+    if "handedness" in demo_df.columns:
+        if demo_df["handedness"].dtype == "object":
+            # 文字列の場合は数値に変換
+            handed_map = {"L": 0, "R": 1, "Left": 0, "Right": 1}
+            demo_df["handedness"] = (
+                demo_df["handedness"].map(handed_map).fillna(0).astype(int)
+            )
+            print(
+                "  ✓ Converted handedness from string to numeric (L/Left=0, R/Right=1)"
+            )
+
     # シーケンスをグループ化
     sequences = []
     demographics = []
@@ -3232,6 +3236,12 @@ def train_models():
             X_all, loaded_labels, loaded_subjects, extractor_state = (
                 FeatureExporter.import_features(import_path)
             )
+
+            # 【重要修正】エクスポート済みのlabels/subjectsで元の変数を置き換える
+            # これにより、features_dfの行順序とlabelsが一致する
+            labels = np.array(loaded_labels)
+            subjects = np.array(loaded_subjects)
+
             # extractor_stateから実際のFeatureExtractorを復元
             temp_extractor = FeatureExtractor(CONFIG)
             if isinstance(extractor_state, dict):
@@ -3242,14 +3252,7 @@ def train_models():
                 temp_extractor = extractor_state
             use_precomputed = True
             print(f"  Raw features loaded! Shape: {X_all.shape}")
-            # Verify the loaded data matches
-            if len(loaded_labels) != len(labels):
-                print(
-                    f"⚠️ Warning: Loaded labels count ({len(loaded_labels)}) doesn't match current ({len(labels)})"
-                )
-                use_precomputed = False
-                X_all = None
-                temp_extractor = None
+            print("  Labels/Subjects synchronized with exported features")
 
     # エクスポート済み特徴量が見つからない場合のみ、新規に抽出
     if not use_precomputed:
@@ -3257,9 +3260,10 @@ def train_models():
         print("📊 Extracting features for all sequences...")
         print(f"  Total sequences: {len(sequences)}")
 
-        # 一時的なextractorを作成して特徴量を抽出（PCAなし、Scalerなし）
+        # 一時的なextractorを作成して特徴量を抽出
         temp_extractor = FeatureExtractor(CONFIG)
-        temp_extractor.config["tof_use_pca"] = False  # 一旦PCAなしで抽出
+        # 【修正】PCAはfold内でfitするため、ここではPCAなしで抽出
+        temp_extractor.config["tof_use_pca"] = False
 
         # ローカル環境では並列処理を使用
         if not IS_KAGGLE_ENV and USE_PARALLEL:
@@ -3374,7 +3378,7 @@ def train_models():
     extractor = temp_extractor
 
     # Cross-validation loop
-    for fold, (train_idx, val_idx) in enumerate(cv.split(labels, labels, subjects)):
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X_all, labels, subjects)):
         # チェックポイントから再開する場合、完了済みのfoldはスキップ
         if fold < start_fold:
             print(
@@ -3389,9 +3393,40 @@ def train_models():
 
         print(f"Train: {len(train_idx)} samples, Val: {len(val_idx)} samples")
 
-        # Scalerをfold内でfit（CVリークを防ぐため）
-        if use_precomputed and X_all is not None:
-            # If using precomputed features, we still need to fit scaler per fold
+        # 【重要修正】fold内でPCAを含む特徴量抽出を行う
+        if CONFIG.get("tof_use_pca", False):
+            # PCAを使用する場合：fold内でfit→transform
+            print("  Fitting PCA and extracting features for this fold...")
+            
+            # このfold用の新しいextractorを作成
+            fold_extractor = FeatureExtractor(CONFIG.copy())
+            fold_extractor.config["tof_use_pca"] = True
+            
+            # trainデータのシーケンスを取得
+            train_sequences = [sequences[i] for i in train_idx]
+            train_demographics = [demographics[i] for i in train_idx]
+            val_sequences = [sequences[i] for i in val_idx]
+            val_demographics = [demographics[i] for i in val_idx]
+            
+            # fold内のtrainデータでPCAとScalerをfit
+            fold_extractor.fit(train_sequences, train_demographics)
+            
+            # trainとvalを変換
+            X_train = fold_extractor.transform(train_sequences, train_demographics)
+            X_val = fold_extractor.transform(val_sequences, val_demographics)
+            
+            # fold固有のアーティファクトを保存（PCA含む）
+            fold_artifacts.append({
+                "feature_names": fold_extractor.feature_names,
+                "scaler": fold_extractor.scaler,
+                "tof_pcas": fold_extractor.tof_pcas  # PCAも保存
+            })
+            
+            # extractorを更新
+            extractor = fold_extractor
+            
+        else:
+            # PCAを使用しない場合：元の処理
             print("  Using precomputed raw features, fitting scaler for this fold...")
             X_train_raw = X_all.iloc[train_idx]
             X_val_raw = X_all.iloc[val_idx]
@@ -3419,33 +3454,6 @@ def train_models():
                 extractor.feature_names = list(X_train.columns)
             if hasattr(extractor, "is_fitted"):
                 extractor.is_fitted = True
-
-            # fold固有のscalerを保存
-            fold_artifacts.append(
-                {"feature_names": list(X_train_raw.columns), "scaler": scaler}
-            )
-        else:
-            # 新規に抽出した特徴量を使用
-            print("  Using newly extracted features, fitting scaler for this fold...")
-            X_train_raw = X_all.iloc[train_idx]
-            X_val_raw = X_all.iloc[val_idx]
-
-            # Fit scaler on train data only
-            if CONFIG["robust_scaler"]:
-                scaler = RobustScaler()
-            else:
-                scaler = StandardScaler()
-
-            X_train = pd.DataFrame(
-                scaler.fit_transform(X_train_raw),
-                columns=X_train_raw.columns,
-                index=X_train_raw.index,
-            )
-            X_val = pd.DataFrame(
-                scaler.transform(X_val_raw),
-                columns=X_val_raw.columns,
-                index=X_val_raw.index,
-            )
 
             # fold固有のscalerを保存
             fold_artifacts.append(
@@ -3863,16 +3871,38 @@ def predict(sequence: pl.DataFrame, demographics: pl.DataFrame) -> str:
         for model in MODELS:
             predictions.append(model.predict_proba(features)[0])
     else:
-        # fold毎のスケーラーを使用して予測
+        # 【修正】fold毎のPCA/スケーラーを使用して予測
         for model, art in zip(MODELS, FOLD_ARTIFACTS):
-            X = X_raw.copy()
-            # 列合わせ
-            for col in art["feature_names"]:
-                if col not in X.columns:
-                    X[col] = 0
-            X = X[art["feature_names"]]
-            # fold専用スケーラで変換
-            Xs = art["scaler"].transform(X)
+            if "tof_pcas" in art:
+                # PCAを含むアーティファクトがある場合
+                fe = FeatureExtractor(CONFIG)
+                fe.tof_pcas = art["tof_pcas"]
+                fe.feature_names = art["feature_names"]
+                fe.scaler = art["scaler"]
+                fe.is_fitted = True
+                
+                # PCA込みで特徴量抽出
+                X = fe.extract_features(seq_df, demo_df)
+                
+                # 列合わせ
+                for col in art["feature_names"]:
+                    if col not in X.columns:
+                        X[col] = 0
+                X = X[art["feature_names"]]
+                
+                # fold専用スケーラで変換
+                Xs = fe.scaler.transform(X)
+            else:
+                # PCAなしの場合（従来の処理）
+                X = X_raw.copy()
+                # 列合わせ
+                for col in art["feature_names"]:
+                    if col not in X.columns:
+                        X[col] = 0
+                X = X[art["feature_names"]]
+                # fold専用スケーラで変換
+                Xs = art["scaler"].transform(X)
+            
             # 予測
             predictions.append(model.predict_proba(Xs)[0])
 
@@ -3940,14 +3970,18 @@ if __name__ == "__main__":
 
     # モデルを訓練
     MODELS, EXTRACTOR, metrics, fold_artifacts = train_models()
-    print("✓ Models trained successfully")
-    print(
-        f"   Binary F1: {metrics['mean_binary_f1']:.4f} ± {metrics['std_binary_f1']:.4f}"
-    )
-    print(
-        f"   Macro F1:  {metrics['mean_macro_f1']:.4f} ± {metrics['std_macro_f1']:.4f}"
-    )
-    print(f"   CV Score:  {metrics['mean_score']:.4f} ± {metrics['std_score']:.4f}")
+    if USE_PRETRAINED_MODEL:
+        print("✓ Pretrained models loaded successfully")
+        print("   No training metrics available (using pretrained models)")
+    else:
+        print("✓ Models trained successfully")
+        print(
+            f"   Binary F1: {metrics['mean_binary_f1']:.4f} ± {metrics['std_binary_f1']:.4f}"
+        )
+        print(
+            f"   Macro F1:  {metrics['mean_macro_f1']:.4f} ± {metrics['std_macro_f1']:.4f}"
+        )
+        print(f"   CV Score:  {metrics['mean_score']:.4f} ± {metrics['std_score']:.4f}")
 
     # Show performance summary
     print("\n" + "=" * 70)
